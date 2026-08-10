@@ -4,16 +4,17 @@ set -e
 # Parse arguments
 HELP=false
 NEW_ENV=false
-NEW_ENV_NAME="behavior"
+NEW_ENV_NAME="behavior_2026"
 OMNIGIBSON=false
 BDDL=false
 JOYLO=false
 DATASET=false
 PRIMITIVES=false
 EVAL=false
+CHALLENGE_EVAL=false
 ASSET_PIPELINE=false
 DEV=false
-CUDA_VERSION="12.8"
+CUDA_VERSION="12.6"
 ACCEPT_CONDA_TOS=false
 ACCEPT_NVIDIA_EULA=false
 ACCEPT_DATASET_TOS=false
@@ -31,7 +32,7 @@ while [[ $# -gt 0 ]]; do
                 NEW_ENV_NAME="$2"
                 shift 2
             else
-                NEW_ENV_NAME="behavior"
+                NEW_ENV_NAME="behavior_2026"
                 shift 1
             fi
             ;;
@@ -41,6 +42,15 @@ while [[ $# -gt 0 ]]; do
         --dataset) DATASET=true; shift ;;
         --primitives) PRIMITIVES=true; shift ;;
         --eval) EVAL=true; shift ;;
+        --challenge-eval)
+            CHALLENGE_EVAL=true
+            OMNIGIBSON=true
+            BDDL=true
+            JOYLO=true
+            EVAL=true
+            DATASET=true
+            shift
+            ;;
         --asset-pipeline) ASSET_PIPELINE=true; shift ;;
         --dev) DEV=true; shift ;;
         --cuda-version) CUDA_VERSION="$2"; shift 2 ;;
@@ -54,7 +64,7 @@ done
 
 # Validate CUDA_VERSION is a valid numeric version string
 if ! [[ "$CUDA_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
-    echo "ERROR: Invalid CUDA_VERSION '$CUDA_VERSION'. Must be in format X.Y (e.g., 12.8)"
+    echo "ERROR: Invalid CUDA_VERSION '$CUDA_VERSION'. Must be in format X.Y (e.g., 12.4)"
     exit 1
 fi
 
@@ -65,37 +75,64 @@ Usage: ./setup.sh [OPTIONS]
 
 Options:
   -h, --help              Display this help message
-  --new-env NEW_ENV_NAME  Create a new conda environment 'NEW_ENV_NAME' (default: behavior)
+  --new-env NEW_ENV_NAME  Create a new conda environment 'NEW_ENV_NAME' (default: behavior_2026)
   --omnigibson            Install OmniGibson (core physics simulator)
   --bddl                  Install BDDL (Behavior Domain Definition Language)
   --joylo                 Install JoyLo (teleoperation interface)
   --dataset               Download BEHAVIOR datasets (requires --omnigibson)
   --primitives            Install OmniGibson with primitives support
   --eval                  Install evaluation dependencies
+  --challenge-eval        Install the complete 2026 challenge evaluation stack and datasets
   --asset-pipeline        Install the 3D scene and object asset pipeline
   --dev                   Install development dependencies
-  --cuda-version VERSION  Specify CUDA version (default: 12.8)
+  --cuda-version VERSION  Specify CUDA version (default: 12.4)
   --accept-conda-tos      Automatically accept Conda Terms of Service
   --accept-nvidia-eula    Automatically accept NVIDIA Isaac Sim EULA
   --accept-dataset-tos    Automatically accept BEHAVIOR Dataset Terms
   --confirm-no-conda      Skip confirmation prompt when not in a conda environment
 
+Example (2026 challenge evaluation): ./setup.sh --new-env --challenge-eval
 Example (core components): ./setup.sh --new-env --omnigibson --bddl --dataset
 Example (full customization): ./setup.sh --new-env my_env --omnigibson --bddl --dataset --joylo --eval --primitives --cuda-version 12.6
-Example (non-interactive): ./setup.sh --new-env --omnigibson --dataset --accept-conda-tos --accept-nvidia-eula --accept-dataset-tos
+Example (non-interactive): ./setup.sh --new-env --challenge-eval --accept-conda-tos --accept-nvidia-eula --accept-dataset-tos
 EOF
     exit 0
 fi
 
 # Validate dependencies
-[ "$OMNIGIBSON" = true ] && [ "$BDDL" = false ] && { echo "ERROR: --omnigibson requires --bddl"; exit 1; }
-[ "$PRIMITIVES" = true ] && [ "$OMNIGIBSON" = false ] && { echo "ERROR: --primitives requires --omnigibson"; exit 1; }
-[ "$EVAL" = true ] && [ "$OMNIGIBSON" = false ] && { echo "ERROR: --eval requires --omnigibson"; exit 1; }
-[ "$EVAL" = true ] && [ "$JOYLO" = false ] && { echo "ERROR: --eval requires --joylo"; exit 1; }
-[ "$NEW_ENV" = true ] && [ "$CONFIRM_NO_CONDA" = true ] && { echo "ERROR: --new-env and --confirm-no-conda are mutually exclusive"; exit 1; }
+# [ "$OMNIGIBSON" = true ] && [ "$BDDL" = false ] && { echo "ERROR: --omnigibson requires --bddl"; exit 1; }
+# [ "$DATASET" = true ] && [ "$OMNIGIBSON" = false ] && { echo "ERROR: --dataset requires --omnigibson"; exit 1; }
+# [ "$PRIMITIVES" = true ] && [ "$OMNIGIBSON" = false ] && { echo "ERROR: --primitives requires --omnigibson"; exit 1; }
+# [ "$EVAL" = true ] && [ "$OMNIGIBSON" = false ] && { echo "ERROR: --eval requires --omnigibson"; exit 1; }
+# [ "$EVAL" = true ] && [ "$JOYLO" = false ] && { echo "ERROR: --eval requires --joylo"; exit 1; }
+# [ "$NEW_ENV" = true ] && [ "$CONFIRM_NO_CONDA" = true ] && { echo "ERROR: --new-env and --confirm-no-conda are mutually exclusive"; exit 1; }
 
 WORKDIR=$(pwd)
 ARCH=$(uname -m)
+CONDA_BIN="$(command -v conda || true)"
+if [ -z "$CONDA_BIN" ] && [ -x "$HOME/miniconda3/condabin/conda" ]; then
+    CONDA_BIN="$HOME/miniconda3/condabin/conda"
+elif [ -z "$CONDA_BIN" ] && [ -x "$HOME/anaconda3/condabin/conda" ]; then
+    CONDA_BIN="$HOME/anaconda3/condabin/conda"
+fi
+
+# The challenge preset always targets the dedicated behavior_2026 environment. If it already
+# exists, reuse it; pass --new-env to create it on the first installation.
+if [ "$CHALLENGE_EVAL" = true ] && [ "$NEW_ENV" = false ]; then
+    [ -n "$CONDA_BIN" ] || { echo "ERROR: Conda not found"; exit 1; }
+    source "$("$CONDA_BIN" info --base)/etc/profile.d/conda.sh"
+    if ! "$CONDA_BIN" env list | awk '{print $1}' | grep -qx "$NEW_ENV_NAME"; then
+        echo "ERROR: Conda environment '$NEW_ENV_NAME' does not exist."
+        echo "Create it with: ./setup.sh --new-env --challenge-eval"
+        exit 1
+    fi
+    echo "Activating existing conda environment '$NEW_ENV_NAME'..."
+    conda activate "$NEW_ENV_NAME"
+    [[ "$CONDA_DEFAULT_ENV" != "$NEW_ENV_NAME" ]] && {
+        echo "ERROR: Failed to activate environment '$NEW_ENV_NAME'"
+        exit 1
+    }
+fi
 
 # Check conda environment condition early (unless creating new environment)
 if [ "$NEW_ENV" = false ]; then
@@ -228,7 +265,7 @@ fi
 # Create conda environment
 if [ "$NEW_ENV" = true ]; then
     echo "Creating conda environment '$NEW_ENV_NAME'..."
-    command -v conda >/dev/null || { echo "ERROR: Conda not found"; exit 1; }
+    [ -n "$CONDA_BIN" ] || { echo "ERROR: Conda not found"; exit 1; }
     
     # Set auto-accept environment variable if user agreed to TOS
     if [ "$ACCEPT_CONDA_TOS" = true ]; then
@@ -236,10 +273,10 @@ if [ "$NEW_ENV" = true ]; then
         echo "✓ Conda TOS auto-acceptance enabled"
     fi
     
-    source "$(conda info --base)/etc/profile.d/conda.sh"
+    source "$("$CONDA_BIN" info --base)/etc/profile.d/conda.sh"
 
     # Check if environment already exists and exit with instructions
-    if conda env list | grep -q "^$NEW_ENV_NAME "; then
+    if "$CONDA_BIN" env list | grep -q "^$NEW_ENV_NAME "; then
         echo ""
         echo "ERROR: Conda environment '$NEW_ENV_NAME' already exists!"
         echo ""
@@ -248,33 +285,130 @@ if [ "$NEW_ENV" = true ]; then
         exit 1
     fi
     
-    # Create environment with Python 3.11 and packaging tools used by this script
-    conda create -n "$NEW_ENV_NAME" python=3.11 pip "setuptools>=71,<81" wheel -c conda-forge -y
+    # Create environment with Python 3.11, packaging tools, and Git LFS for LeRobot dependencies.
+    "$CONDA_BIN" create -n "$NEW_ENV_NAME" python=3.11 pip "setuptools>=71,<81" wheel git-lfs -c conda-forge -y
     conda activate "$NEW_ENV_NAME"
     
     [[ "$CONDA_DEFAULT_ENV" != "$NEW_ENV_NAME" ]] && { echo "ERROR: Failed to activate environment '$NEW_ENV_NAME'"; exit 1; }
 
 fi
 
+# Always use the selected conda environment's interpreter, even if the caller has another
+# virtual environment (for example pi05_env) active earlier in PATH.
+if [ "$NEW_ENV" = true ] || [ "$CHALLENGE_EVAL" = true ]; then
+    if [ -n "$VIRTUAL_ENV" ]; then
+        echo "Ignoring previously active virtual environment: $VIRTUAL_ENV"
+    fi
+    unset VIRTUAL_ENV PYTHONHOME PYTHONPATH
+    export PYTHONNOUSERSITE=1
+    export PATH="$CONDA_PREFIX/bin:$PATH"
+    hash -r
+    PYTHON_BIN="$CONDA_PREFIX/bin/python"
+else
+    PYTHON_BIN="$(command -v python)"
+fi
+if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+    echo "ERROR: Python interpreter not found or not executable: ${PYTHON_BIN:-<unset>}"
+    exit 1
+fi
+run_python() {
+    "$PYTHON_BIN" "$@"
+}
+echo "Using Python interpreter: $PYTHON_BIN"
+echo "Python version: $(run_python --version 2>&1)"
+
+verify_isaac_sim_installation() {
+    run_python - <<'PY'
+import os
+from importlib.metadata import PackageNotFoundError, version
+
+required_distributions = (
+    "isaacsim",
+    "isaacsim-app",
+    "isaacsim-core",
+    "isaacsim-kernel",
+)
+missing = []
+for distribution in required_distributions:
+    try:
+        version(distribution)
+    except PackageNotFoundError:
+        missing.append(distribution)
+
+if missing:
+    raise SystemExit(f"Missing Isaac Sim distributions: {', '.join(missing)}")
+
+import isaacsim  # noqa: F401, E402
+
+isaac_path = os.environ.get("ISAAC_PATH")
+if not isaac_path:
+    raise SystemExit("Importing isaacsim did not set ISAAC_PATH")
+
+version_file = os.path.join(isaac_path, "VERSION")
+if not os.path.isfile(version_file):
+    raise SystemExit(f"Isaac Sim VERSION file not found: {version_file}")
+PY
+}
+
+# LeRobot is installed from git and may reference files managed by Git LFS.
+if [ "$OMNIGIBSON" = true ]; then
+    GIT_LFS_BIN="$(command -v git-lfs || true)"
+    if [ -z "$GIT_LFS_BIN" ] && [ "$CHALLENGE_EVAL" = true ]; then
+        echo "Installing Git LFS into '$NEW_ENV_NAME'..."
+        "$CONDA_BIN" install -p "$CONDA_PREFIX" git-lfs -c conda-forge -y
+        hash -r
+        GIT_LFS_BIN="$CONDA_PREFIX/bin/git-lfs"
+    fi
+    if [ -z "$GIT_LFS_BIN" ] || [ ! -x "$GIT_LFS_BIN" ]; then
+        echo "ERROR: git-lfs is required to install LeRobot. Install it in the active conda environment first."
+        exit 1
+    fi
+    "$GIT_LFS_BIN" install --skip-repo
+    echo "Git LFS: $("$GIT_LFS_BIN" version)"
+fi
+
 # Install PyTorch via pip with CUDA support
 echo "Installing PyTorch with CUDA $CUDA_VERSION support..."
 
-# Determine the CUDA version string for pip URL (e.g., cu128, cu126, etc.)
-CUDA_VER_SHORT=$(echo "$CUDA_VERSION" | sed 's/\.//g')  # e.g. convert 12.8 to 128
+# Select a PyTorch release that has official wheels for the requested CUDA version.
+CUDA_VER_SHORT=$(echo "$CUDA_VERSION" | sed 's/\.//g')  # e.g. convert 12.4 to 124
+case "$CUDA_VERSION" in
+    12.4)
+        TORCH_VERSION="2.6.0"
+        TORCHVISION_VERSION="0.21.0"
+        TORCHAUDIO_VERSION="2.6.0"
+        TORCHCODEC_VERSION="0.2"
+        ;;
+    12.6|12.8)
+        TORCH_VERSION="2.7.0"
+        TORCHVISION_VERSION="0.22.0"
+        TORCHAUDIO_VERSION="2.7.0"
+        TORCHCODEC_VERSION="0.5"
+        ;;
+    *)
+        echo "ERROR: Unsupported CUDA version '$CUDA_VERSION'. Supported versions: 12.4, 12.6, 12.8"
+        exit 1
+        ;;
+esac
 
-python -m pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 torchcodec==0.5 --index-url https://download.pytorch.org/whl/cu${CUDA_VER_SHORT}
+run_python -m pip install \
+    "torch==$TORCH_VERSION" \
+    "torchvision==$TORCHVISION_VERSION" \
+    "torchaudio==$TORCHAUDIO_VERSION" \
+    --index-url "https://download.pytorch.org/whl/cu${CUDA_VER_SHORT}"
+run_python -m pip install "torchcodec==$TORCHCODEC_VERSION"
 
 echo "✓ PyTorch installation completed"
 
 # Install numpy <2 to avoid conflicts
 echo "Installing numpy..."
-python -m pip install "numpy<2"
+run_python -m pip install "numpy<2"
 
 # Install BDDL
 if [ "$BDDL" = true ]; then
     echo "Installing BDDL..."
     [ ! -d "bddl3" ] && { echo "ERROR: bddl directory not found"; exit 1; }
-    python -m pip install -e "$WORKDIR/bddl3"
+    run_python -m pip install -e "$WORKDIR/bddl3"
 fi
 
 # Install OmniGibson with Isaac Sim
@@ -283,7 +417,7 @@ if [ "$OMNIGIBSON" = true ]; then
     [ ! -d "OmniGibson" ] && { echo "ERROR: OmniGibson directory not found"; exit 1; }
     
     # Check Python version
-    PYTHON_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    PYTHON_VERSION=$(run_python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     [ "$PYTHON_VERSION" != "3.11" ] && { echo "ERROR: Python 3.11 required, found $PYTHON_VERSION"; exit 1; }
     
     # Check for conflicting environment variables
@@ -309,12 +443,12 @@ if [ "$OMNIGIBSON" = true ]; then
         EXTRAS="[${EXTRAS%,}]"
     fi
 
-    python -m pip install -e "$WORKDIR/OmniGibson$EXTRAS" --no-build-isolation
+    run_python -m pip install -e "$WORKDIR/OmniGibson$EXTRAS" --no-build-isolation
 
     # Install pre-commit for dev setup
     if [ "$DEV" = true ]; then
         echo "Setting up pre-commit..."
-        conda install -c conda-forge pre-commit -y
+        "$CONDA_BIN" install -c conda-forge pre-commit -y
         cd "$WORKDIR/OmniGibson"
         pre-commit install || true  # Ignore errors here in case the directory is not a git repo
         cd "$WORKDIR"
@@ -328,15 +462,16 @@ if [ "$OMNIGIBSON" = true ]; then
         exit 1
     fi
     
-    # Check if already installed
-    if python -c "import isaacsim" 2>/dev/null; then
+    # A partial extscache install creates an importable isaacsim namespace package, so an
+    # import alone is not enough to prove that the Isaac Sim runtime is complete.
+    if verify_isaac_sim_installation >/dev/null 2>&1; then
         echo "Isaac Sim already installed, skipping..."
     else
         echo "Installing Isaac Sim via pip..."
 
         # For aarch, do alternative install via direct one-liner
         if [ "$ARCH" = "aarch64" ]; then
-            python -m pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia.com
+            run_python -m pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia.com
         else
             # Helper functions
             check_glibc_old() {
@@ -382,7 +517,7 @@ if [ "$OMNIGIBSON" = true ]; then
                     local filepath="$temp_dir/$filename"
 
                     echo "Downloading $pkg..."
-                    if ! curl -sL "$url" -o "$filepath"; then
+                    if ! curl -fLsS "$url" -o "$filepath"; then
                         echo "ERROR: Failed to download $pkg"
                         rm -rf "$temp_dir"
                         return 1
@@ -399,21 +534,18 @@ if [ "$OMNIGIBSON" = true ]; then
                 done
 
                 echo "Installing Isaac Sim packages..."
-                python -m pip install "${wheel_files[@]}"
+                run_python -m pip install "${wheel_files[@]}"
                 rm -rf "$temp_dir"
 
-                # Verify installation
-                if ! python -c "import isaacsim" 2>/dev/null; then
-                    echo "ERROR: Isaac Sim installation verification failed"
-                    return 1
-                fi
             }
 
             install_isaac_packages || { echo "ERROR: Isaac Sim installation failed"; exit 1; }
         fi
+
+        verify_isaac_sim_installation || { echo "ERROR: Isaac Sim installation verification failed"; exit 1; }
         
         # Extract ISAAC_PATH from isaacsim module
-        ISAAC_PATH=$(python -c "import isaacsim, os; print(os.environ.get('ISAAC_PATH', ''))" 2>/dev/null)
+        ISAAC_PATH=$(run_python -c "import isaacsim, os; print(os.environ.get('ISAAC_PATH', ''))" 2>/dev/null)
 
         # Fix websockets conflict - remove any pip_prebundle/websockets under extscache
         if [ -n "$ISAAC_PATH" ] && [ -d "$ISAAC_PATH/extscache" ]; then
@@ -430,9 +562,9 @@ if [ "$OMNIGIBSON" = true ]; then
     fi
     
     # Force reinstall cffi 1.17.1 to resolve compatibility issues with Isaac Sim extensions
-    python -m pip install --force-reinstall cffi==1.17.1
+    run_python -m pip install --force-reinstall cffi==1.17.1
     # Force reinstall websockets >= 15.0.1 because it's been overwritten by Isaac Sim with an older version
-    python -m pip install --force-reinstall "websockets>=15.0.1"
+    run_python -m pip install --force-reinstall "websockets>=15.0.1"
 
     echo "OmniGibson installation completed successfully!"
 fi
@@ -441,26 +573,26 @@ fi
 if [ "$JOYLO" = true ]; then
     echo "Installing JoyLo..."
     [ ! -d "joylo" ] && { echo "ERROR: joylo directory not found"; exit 1; }
-    python -m pip install -e "$WORKDIR/joylo"
+    run_python -m pip install -e "$WORKDIR/joylo"
 fi
 
 # Install Eval
 if [ "$EVAL" = true ]; then
     # get torch version via pip and install corresponding torch-cluster
-    TORCH_VERSION=$(python -m pip show torch | grep Version | cut -d " " -f 2)
-    python -m pip install torch-cluster -f https://data.pyg.org/whl/torch-${TORCH_VERSION}.html
+    INSTALLED_TORCH_VERSION=$(run_python -m pip show torch | grep Version | cut -d " " -f 2)
+    run_python -m pip install torch-cluster -f https://data.pyg.org/whl/torch-${INSTALLED_TORCH_VERSION}.html
 fi
 
 # Install asset pipeline
 if [ "$ASSET_PIPELINE" = true ]; then
     echo "Installing asset pipeline..."
     [ ! -d "asset_pipeline" ] && { echo "ERROR: asset_pipeline directory not found"; exit 1; }
-    python -m pip install -r "$WORKDIR/asset_pipeline/requirements.txt"
+    run_python -m pip install -r "$WORKDIR/asset_pipeline/requirements.txt"
 fi
 
 # Install datasets
 if [ "$DATASET" = true ]; then
-    python -c "import omnigibson" || {
+    run_python -c "import omnigibson" || {
         echo "ERROR: OmniGibson import failed, please make sure you have omnigibson installed before downloading datasets"
         exit 1
     }
@@ -478,22 +610,43 @@ if [ "$DATASET" = true ]; then
     export OMNI_KIT_ACCEPT_EULA=YES
     
     echo "Downloading OmniGibson robot assets..."
-    python -c "from omnigibson.utils.asset_utils import download_omnigibson_robot_assets; download_omnigibson_robot_assets()" || {
+    run_python -c "from omnigibson.utils.asset_utils import download_omnigibson_robot_assets; download_omnigibson_robot_assets()" || {
         echo "ERROR: OmniGibson robot assets installation failed"
         exit 1
     }
 
     echo "Downloading BEHAVIOR-1K assets..."
-    python -c "from omnigibson.utils.asset_utils import download_behavior_1k_assets; download_behavior_1k_assets(accept_license=${DATASET_ACCEPT_FLAG})" || {
+    run_python -c "from omnigibson.utils.asset_utils import download_behavior_1k_assets; download_behavior_1k_assets(accept_license=${DATASET_ACCEPT_FLAG})" || {
         echo "ERROR: Dataset installation failed"
         exit 1
     }
 
     echo "Downloading 2026 BEHAVIOR Challenge Task Instances..."
-    python -c "from omnigibson.utils.asset_utils import download_2026_challenge_task_instances; download_2026_challenge_task_instances()" || {
+    run_python -c "from omnigibson.utils.asset_utils import download_2026_challenge_task_instances; download_2026_challenge_task_instances()" || {
         echo "ERROR: 2026 BEHAVIOR Challenge Task Instances installation failed"
         exit 1
     }
+fi
+
+# Verify the requested installation before reporting success.
+echo "Running installation smoke checks..."
+if [ "$BDDL" = true ]; then
+    run_python -c "import bddl; print('✓ BDDL import check passed')"
+fi
+if [ "$OMNIGIBSON" = true ]; then
+    verify_isaac_sim_installation
+    run_python -c "import omnigibson; print('✓ Isaac Sim and OmniGibson import checks passed')"
+fi
+if [ "$JOYLO" = true ]; then
+    run_python -c "import gello; print('✓ JoyLo import check passed')"
+fi
+if [ "$EVAL" = true ]; then
+    OMNIGIBSON_HEADLESS=1 run_python -m omnigibson.eval.eval --help >/dev/null
+    echo "✓ Evaluation CLI check passed"
+fi
+if [ "$DATASET" = true ]; then
+    OMNIGIBSON_HEADLESS=1 run_python -c \
+        "from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_INDICES; assert len(TASK_NAMES_TO_INDICES) == 100; print('✓ 2026 challenge metadata check passed')"
 fi
 
 echo ""

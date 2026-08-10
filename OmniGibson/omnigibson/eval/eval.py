@@ -22,16 +22,12 @@ import logging
 import os
 from pathlib import Path
 
-from omegaconf import OmegaConf
-
-from omnigibson.eval.evaluator import Evaluator, resolve_instance_ids
-from omnigibson.eval.utils.eval_utils import DEFAULT_EVAL_SEED, seed_everything
-from omnigibson.macros import gm
-from omnigibson.utils.ui_utils import create_module_logger
-
-
-logger = create_module_logger(module_name=__name__)
-logger.setLevel(logging.INFO)
+from omnigibson.eval.utils.cpu_utils import (
+    apply_cpu_config,
+    configure_runtime_thread_pools,
+    format_cpu_affinity,
+    resolve_cpu_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,11 +92,77 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Run OmniGibson headless (default: True).",
     )
+    parser.add_argument(
+        "--cpu-affinity",
+        default=None,
+        help=(
+            "Explicit Linux CPU list for this evaluator, e.g. '0-19,40-43'. "
+            "Defaults to EVAL_CPU_AFFINITY when set."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-cores-per-env",
+        type=int,
+        default=None,
+        help=(
+            "Number of allowed CPUs to assign to this evaluator. CPUs are selected using --cpu-worker-index. "
+            "Defaults to EVAL_CPU_CORES_PER_ENV when set."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-worker-index",
+        type=int,
+        default=None,
+        help=(
+            "Zero-based worker index used with --cpu-cores-per-env. "
+            "Defaults to EVAL_CPU_WORKER_INDEX, or 0 when cores-per-env is configured."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-num-threads",
+        type=int,
+        default=None,
+        help=(
+            "Thread limit for native libraries, Torch, and OpenCV. Defaults to EVAL_CPU_NUM_THREADS, "
+            "or to the assigned CPU count when affinity is enabled."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    try:
+        cpu_config = resolve_cpu_config(
+            cpu_affinity=args.cpu_affinity,
+            cpu_cores_per_env=args.cpu_cores_per_env,
+            cpu_worker_index=args.cpu_worker_index,
+            cpu_num_threads=args.cpu_num_threads,
+        )
+        apply_cpu_config(cpu_config)
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(f"CPU configuration error: {exc}") from exc
+
+    # Apply CPU settings before importing the evaluator and creating the Isaac Sim environment.
+    configure_runtime_thread_pools(cpu_config.num_threads)
+
+    from omegaconf import OmegaConf
+
+    from omnigibson.eval.evaluator import Evaluator, resolve_instance_ids
+    from omnigibson.eval.utils.eval_utils import DEFAULT_EVAL_SEED, seed_everything
+    from omnigibson.macros import gm
+    from omnigibson.utils.ui_utils import create_module_logger
+
+    logger = create_module_logger(module_name=__name__)
+    logger.setLevel(logging.INFO)
+    effective_affinity = os.sched_getaffinity(0)
+    logger.info(
+        "Evaluator resources: "
+        f"pid={os.getpid()} worker_index={cpu_config.worker_index} "
+        f"cpus={format_cpu_affinity(effective_affinity)} num_threads={cpu_config.num_threads} "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+    )
 
     gm.HEADLESS = args.headless
 
