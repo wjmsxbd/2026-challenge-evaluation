@@ -67,6 +67,8 @@ class BehaviorTask(BaseTask):
         include_obs (bool): Whether to include observations or not for this task
     """
 
+    supports_synchronized_scene_reset = True
+
     def __init__(
         self,
         activity_name=None,
@@ -106,6 +108,8 @@ class BehaviorTask(BaseTask):
 
         # Scene info
         self.scene_name = None
+        self._callback_name = None
+        self._callback_scene = None
 
         # Object info
         self.online_object_sampling = online_object_sampling  # bool
@@ -214,16 +218,39 @@ class BehaviorTask(BaseTask):
                 if not is_system_bddl_inst(inst) and entity is not None:
                     entity.highlighted = True
 
-        # Add callbacks to handle internal processing when new systems / objects are added / removed to the scene
-        callback_name = f"{self.activity_name}_refresh"
-        og.sim.add_callback_on_add_obj(name=callback_name, callback=self._update_bddl_scope_from_added_obj)
-        og.sim.add_callback_on_remove_obj(name=callback_name, callback=self._update_bddl_scope_from_removed_obj)
+        # Simulator callbacks are global. Give every task instance its own registration and filter callback payloads by
+        # scene so duplicated vector scenes cannot overwrite or populate one another's BDDL scopes.
+        self._register_scope_callbacks(env)
 
-        og.sim.add_callback_on_system_init(name=callback_name, callback=self._update_bddl_scope_from_system_init)
-        og.sim.add_callback_on_system_clear(name=callback_name, callback=self._update_bddl_scope_from_system_clear)
+    def _register_scope_callbacks(self, env):
+        self._unregister_scope_callbacks()
+        self._callback_scene = env.scene
+        self._callback_name = f"{self.activity_name}_refresh_scene_{env.scene.idx}_task_{id(self)}"
+        og.sim.add_callback_on_add_obj(name=self._callback_name, callback=self._update_bddl_scope_from_added_obj)
+        og.sim.add_callback_on_remove_obj(name=self._callback_name, callback=self._update_bddl_scope_from_removed_obj)
+        og.sim.add_callback_on_system_init(name=self._callback_name, callback=self._update_bddl_scope_from_system_init)
+        og.sim.add_callback_on_system_clear(name=self._callback_name, callback=self._update_bddl_scope_from_system_clear)
 
-    def reset(self, env):
-        super().reset(env)
+    def _unregister_scope_callbacks(self):
+        callback_name = self._callback_name
+        if callback_name is not None and og.sim is not None:
+            og.sim.remove_callback_on_add_obj(callback_name)
+            og.sim.remove_callback_on_remove_obj(callback_name)
+            og.sim.remove_callback_on_system_init(callback_name)
+            og.sim.remove_callback_on_system_clear(callback_name)
+        self._callback_name = None
+        self._callback_scene = None
+
+    def close(self):
+        self._unregister_scope_callbacks()
+
+    def _callback_entity_is_in_scene(self, entity):
+        # Object and system callbacks run while their private scene reference is still valid. Reading the private field
+        # avoids asserting if a late lifecycle callback observes an entity that has already started teardown.
+        return self._callback_scene is not None and getattr(entity, "_scene", None) is self._callback_scene
+
+    def reset(self, env, reset_scene=True):
+        super().reset(env, reset_scene=reset_scene)
 
         # Use presampled robot pose if specified (only available for officially supported mobile manipulators)
         if self.use_presampled_robot_pose:
@@ -633,6 +660,8 @@ class BehaviorTask(BaseTask):
         Args:
             obj (USDObject): Newly imported object
         """
+        if not self._callback_entity_is_in_scene(obj):
+            return
         for inst, entity in self.object_scope.items():
             if (
                 entity is None
@@ -650,6 +679,8 @@ class BehaviorTask(BaseTask):
         Args:
             obj (USDObject): Newly removed object
         """
+        if not self._callback_entity_is_in_scene(obj):
+            return
         for inst, entity in self.object_scope.items():
             if entity is not None and not is_system_bddl_inst(inst) and obj.name == entity.name:
                 self.object_scope[inst] = None
@@ -663,6 +694,8 @@ class BehaviorTask(BaseTask):
         Args:
             system (BaseSystem): Newly initialized system
         """
+        if not self._callback_entity_is_in_scene(system):
+            return
         for inst, entity in self.object_scope.items():
             if entity is None and is_system_bddl_inst(inst) and og_categories_from_bddl_inst(inst)[0] == system.name:
                 self.object_scope[inst] = system
@@ -676,6 +709,8 @@ class BehaviorTask(BaseTask):
         Args:
             system (BaseSystem): Newly cleared system
         """
+        if not self._callback_entity_is_in_scene(system):
+            return
         for inst, entity in self.object_scope.items():
             if entity is not None and is_system_bddl_inst(inst) and system.name == entity.name:
                 self.object_scope[inst] = None

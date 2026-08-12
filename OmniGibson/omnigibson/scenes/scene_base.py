@@ -725,7 +725,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             # Remove from omni stage
             obj.remove()
 
-    def reset(self, hard=True):
+    def reset(self, hard=True, step_physics=True):
         """
         Resets this scene
 
@@ -733,6 +733,9 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             hard (bool): If set, will force the set of active objects currently in the sim to match
                 the specified objects stored in self._initial_file. Otherwise, will only load the kinematic and semantic
                 state for any objects that are currently in the sim, ignoring any additional / missing objects
+            step_physics (bool): Whether to advance one physics timestep after restoring the scene. This should normally
+                remain True. Vector environments may restore every scene with this disabled and then issue one shared
+                physics step so reset order does not advance earlier slots more than later slots.
         """
         # Make sure the simulator is playing
         assert og.sim.is_playing(), "Simulator must be playing in order to reset the scene!"
@@ -746,7 +749,8 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         else:
             self.load_state(self._initial_file["state"], serialized=False)
 
-        og.sim.step_physics()
+        if step_physics:
+            og.sim.step_physics()
 
     def save(self, json_path=None, as_dict=False):
         """

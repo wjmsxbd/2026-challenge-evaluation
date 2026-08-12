@@ -27,6 +27,8 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
         include_obs (bool): Whether to include observations or not for this task
     """
 
+    supports_synchronized_scene_reset = False
+
     def __init__(self, termination_config=None, reward_config=None, include_obs=True):
         # Make sure configs are dictionaries
         termination_config = dict() if termination_config is None else termination_config
@@ -205,15 +207,18 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
         self._success = False
         self._info = None
 
-    def reset(self, env):
+    def reset(self, env, reset_scene=True):
         """
         Resets this task in the environment
 
         Args:
             env (Environment): environment instance to reset
+            reset_scene (bool): Whether to restore and step the scene before resetting the agent and task bookkeeping.
+                Vector environments set this to False after restoring all scenes and issuing one shared physics step.
         """
         # Reset the scene, agent, and variables
-        self._reset_scene(env)
+        if reset_scene:
+            self._reset_scene(env)
         self._reset_agent(env)
         self._reset_variables(env)
 
@@ -222,6 +227,10 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
             termination_condition.reset(self, env)
         for reward_function in self._reward_functions.values():
             reward_function.reset(self, env)
+
+    def close(self):
+        """Release task-owned resources. Subclasses may override this method; the default is a no-op."""
+        pass
 
     def _step_termination(self, env, action, info=None):
         """

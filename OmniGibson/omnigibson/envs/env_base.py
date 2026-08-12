@@ -212,6 +212,10 @@ class Environment(gym.Env, GymObservable, Recreatable):
         task_type = self.task_config["type"]
         assert_valid_key(key=task_type, valid_keys=REGISTERED_TASKS, name="task type")
 
+        # Release any global callbacks or other resources owned by the previous task before replacing it.
+        if self._task is not None:
+            self._task.close()
+
         # Grab the kwargs relevant for the specific task and create the task
         self._task = create_class_from_registry_and_config(
             cls_name=self.task_config["type"],
@@ -469,8 +473,9 @@ class Environment(gym.Env, GymObservable, Recreatable):
         self._loaded = True
 
     def close(self):
-        """No-op to satisfy certain RL frameworks."""
-        pass
+        """Release resources owned by this environment's task."""
+        if self._task is not None:
+            self._task.close()
 
     def get_obs(self):
         """

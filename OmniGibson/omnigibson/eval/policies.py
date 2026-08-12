@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 import torch as th
 from omnigibson.eval.utils.network_utils import WebsocketClientPolicy
 from typing import Optional
@@ -67,8 +68,20 @@ class WebsocketPolicy:
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
         if "need_new_action" in obs and not obs["need_new_action"] and self.last_action is not None:
             return self.last_action
-        self.last_action = self.policy.act(obs).detach().cpu()
+        response = self.infer(obs)
+        self.last_action = th.from_numpy(np.asarray(response["action"]).copy()).to(th.float32).detach().cpu()
         return self.last_action
+
+    def infer(self, obs: dict, *args, **kwargs) -> dict:
+        """Return the complete websocket response, including optional action chunks."""
+        if self.policy is None:
+            raise RuntimeError("Websocket policy has not been connected to a server")
+        return self.policy.infer(obs)
+
+    def get_server_metadata(self) -> dict:
+        if self.policy is None:
+            return {}
+        return self.policy.get_server_metadata() or {}
 
     def reset(self) -> None:
         if self.policy is not None:

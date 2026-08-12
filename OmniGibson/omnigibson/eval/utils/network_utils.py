@@ -60,6 +60,8 @@ class WebsocketClientPolicy:
         self._allow_reconnect = allow_reconnect
 
     def get_server_metadata(self) -> Dict:
+        if self._ws is None:
+            self._ws, self._server_metadata = self._wait_for_server()
         return self._server_metadata
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
@@ -101,6 +103,13 @@ class WebsocketClientPolicy:
                 time.sleep(5)
 
     def act(self, obs: Dict) -> th.Tensor:
+        response = self.infer(obs)
+        if "action" not in response:
+            raise RuntimeError(f"Server response missing 'action' key: {response}")
+        return th.from_numpy(np.asarray(deepcopy(response["action"])).copy()).to(th.float32)
+
+    def infer(self, obs: Dict) -> Dict:
+        """Send one observation payload and return the complete server response."""
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
@@ -115,16 +124,10 @@ class WebsocketClientPolicy:
                 if isinstance(response, str):
                     raise RuntimeError(f"Error in inference server:\n{response}")
 
-                action_dict = unpackb(response)
-                if "action" not in action_dict:
-                    if attempt < max_retries:
-                        logger.warning(
-                            f"Server response missing 'action' key, retrying ({attempt + 1}/{max_retries})..."
-                        )
-                        continue
-                    raise RuntimeError(f"Server response missing 'action' key: {action_dict}")
-                action = th.from_numpy(deepcopy(action_dict["action"])).to(th.float32)
-                return action
+                result = unpackb(response)
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"Policy server returned {type(result).__name__}, expected a dict")
+                return result
 
             except websockets.exceptions.ConnectionClosedError as e:
                 if self._allow_reconnect and attempt < max_retries:
