@@ -29,7 +29,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-rollouts", type=int, default=1)
     parser.add_argument("--num-envs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0, help="Fixed environment RNG seed (default: 0).")
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Absolute episode timeout in steps. When set, overrides --max-steps-multiplier.",
+    )
+    parser.add_argument(
+        "--max-steps-multiplier",
+        type=float,
+        default=1.5,
+        help="Episode timeout as a multiple of the mean human-demo length (default: 1.5).",
+    )
     parser.add_argument("--env-wrapper", default="omnigibson.eval.wrappers.DefaultWrapper")
     parser.add_argument("--output-dir", default="/tmp/b1k_eval_vector")
     parser.add_argument("--write-video", action=argparse.BooleanOptionalAction, default=False)
@@ -99,6 +110,10 @@ def main() -> None:
         raise SystemExit("The 2026 challenge protocol requires --num-rollouts 1")
     if not 0 <= args.seed < 2**32:
         raise SystemExit("--seed must be in [0, 2**32)")
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise SystemExit("--max-steps must be positive")
+    if args.max_steps_multiplier <= 0:
+        raise SystemExit("--max-steps-multiplier must be positive")
     if args.mode == "hidden_test":
         raise SystemExit("Hidden 2026 task instances are reserved for organizer-run final evaluation")
 
@@ -137,6 +152,7 @@ def main() -> None:
             "mode": args.mode,
             "num_envs": args.num_envs,
             "max_steps": args.max_steps,
+            "max_steps_multiplier": args.max_steps_multiplier,
             "env_wrapper": {"_target_": args.env_wrapper},
             "output_dir": str(Path(args.output_dir).expanduser()),
             "write_video": args.write_video,

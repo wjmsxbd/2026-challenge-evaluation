@@ -65,7 +65,13 @@ def parse_args() -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=None,
-        help="Episode timeout in steps. Default (None) = 1.5x mean human-demo length.",
+        help="Absolute episode timeout in steps. When set, overrides --max-steps-multiplier.",
+    )
+    parser.add_argument(
+        "--max-steps-multiplier",
+        type=float,
+        default=1.5,
+        help="Episode timeout as a multiple of the mean human-demo length (default: 1.5).",
     )
     parser.add_argument(
         "--env-wrapper",
@@ -166,6 +172,11 @@ def main() -> None:
 
     gm.HEADLESS = args.headless
 
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise SystemExit("--max-steps must be positive")
+    if args.max_steps_multiplier <= 0:
+        raise SystemExit("--max-steps-multiplier must be positive")
+
     seed = seed_everything(DEFAULT_EVAL_SEED)
     logger.info(f"Seeded Python, NumPy, and Torch with seed={seed}")
 
@@ -195,6 +206,7 @@ def main() -> None:
             "headless": args.headless,
             "partial_scene_load": True,
             "max_steps": args.max_steps,
+            "max_steps_multiplier": args.max_steps_multiplier,
             "write_video": args.write_video,
             "mode": args.mode,
             "seed": seed,

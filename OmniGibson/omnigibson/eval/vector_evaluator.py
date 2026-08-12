@@ -316,9 +316,12 @@ class VectorChunkEvaluator:
         config["robots"] = [robot_cfg]
 
         if self.cfg.max_steps is None:
-            max_steps = int(self.human_stats["length"] * EVAL_TIMEOUT_MULTIPLIER)
+            max_steps_multiplier = float(self.cfg.get("max_steps_multiplier", EVAL_TIMEOUT_MULTIPLIER))
+            max_steps = int(self.human_stats["length"] * max_steps_multiplier)
+            timeout_description = f" ({max_steps_multiplier}x mean human length)"
         else:
             max_steps = int(self.cfg.max_steps)
+            timeout_description = " (absolute override)"
         config["task"]["termination_config"]["max_steps"] = max_steps
         config["task"]["include_obs"] = False
         logger.info(
@@ -327,7 +330,7 @@ class VectorChunkEvaluator:
             config["env"]["rendering_frequency"],
             config["env"]["action_frequency"],
             max_steps,
-            " (1.5x mean human length)" if self.cfg.max_steps is None else " (override)",
+            timeout_description,
         )
         return config
 

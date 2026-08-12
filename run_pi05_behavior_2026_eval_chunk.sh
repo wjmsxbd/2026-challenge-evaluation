@@ -42,6 +42,7 @@ TASK_LIMIT="${TASK_LIMIT:-100}"
 EVAL_INSTANCE_INDICES="${EVAL_INSTANCE_INDICES:-0 1 2 3 4 5 6 7 8 9}"
 EVAL_INSTANCE_INDICES="${EVAL_INSTANCE_INDICES//,/ }"
 EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-}"
+EVAL_MAX_STEPS_MULTIPLIER="${EVAL_MAX_STEPS_MULTIPLIER:-1.5}"
 EVAL_SEED="${EVAL_SEED:-0}"
 
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -116,7 +117,8 @@ Core overrides:
   TASK_LIMIT                Limit queued tasks after selection, default 100.
   EVAL_INSTANCE_INDICES     Public split indices, default '0 1 2 3 4 5 6 7 8 9'.
   EVAL_SEED                 Fixed environment RNG seed, default 0.
-  EVAL_MAX_STEPS            Optional smoke-test timeout; empty preserves official 1.5x timeout.
+  EVAL_MAX_STEPS            Optional absolute timeout override; empty uses the human-length multiplier.
+  EVAL_MAX_STEPS_MULTIPLIER Multiplier applied to mean human-demo length, default 1.5.
   EVAL_MAX_TASK_ATTEMPTS    Whole-task attempts before terminal failure, default 2.
   GPU_IDS / NUM_GPUS        GPU IDs and number of colocated env/server pairs.
   PI05_REPO                 100-task PI0.5 source checkout; must contain champion_2026 config.
@@ -164,6 +166,13 @@ validate_bool() {
 
 validate_positive_int() {
   [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "$1 must be a positive integer, got: $2" >&2; exit 1; }
+}
+
+validate_positive_float() {
+  awk -v value="$2" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0) }' || {
+    echo "$1 must be a positive number, got: $2" >&2
+    exit 1
+  }
 }
 
 validate_seed() {
@@ -305,6 +314,8 @@ validate_environment() {
   validate_positive_int PI05_DYNAMIC_BATCH_GRANULARITY "${PI05_DYNAMIC_BATCH_GRANULARITY}"
   validate_positive_int TASK_LIMIT "${TASK_LIMIT}"
   validate_positive_int EVAL_MAX_TASK_ATTEMPTS "${EVAL_MAX_TASK_ATTEMPTS}"
+  validate_positive_float EVAL_MAX_STEPS_MULTIPLIER "${EVAL_MAX_STEPS_MULTIPLIER}"
+  [[ -z "${EVAL_MAX_STEPS}" ]] || validate_positive_int EVAL_MAX_STEPS "${EVAL_MAX_STEPS}"
   validate_seed EVAL_SEED "${EVAL_SEED}"
   validate_bool EVAL_WRITE_VIDEO "${EVAL_WRITE_VIDEO}"
   validate_bool EVAL_PARTIAL_SCENE_LOAD "${EVAL_PARTIAL_SCENE_LOAD}"
@@ -555,6 +566,7 @@ launch_eval() {
     --pi05-base-velocity-frame "${PI05_BASE_VELOCITY_FRAME}"
   )
   [[ -z "${EVAL_MAX_STEPS}" ]] || args+=(--max-steps "${EVAL_MAX_STEPS}")
+  [[ -n "${EVAL_MAX_STEPS}" ]] || args+=(--max-steps-multiplier "${EVAL_MAX_STEPS_MULTIPLIER}")
   [[ "${EVAL_WRITE_VIDEO}" == true ]] && args+=(--write-video) || args+=(--no-write-video)
   [[ "${EVAL_PARTIAL_SCENE_LOAD}" == true ]] && args+=(--partial-scene-load) || args+=(--no-partial-scene-load)
   [[ "${PI05_APPLY_EVAL_TRICKS}" == true ]] && args+=(--apply-eval-tricks) || args+=(--no-apply-eval-tricks)
@@ -748,7 +760,7 @@ echo "PI0.5 accelerated BEHAVIOR 2026 official evaluation:"
 echo "  protocol: ${TASK_COUNT} tasks x ${INSTANCE_COUNT} public instances x 1 rollout = ${EXPECTED_RESULTS} outputs"
 echo "  supported task IDs: ${TASK_IDS:-0-99}"
 echo "  public instance indices: ${INSTANCE_INDEX_LIST[*]}"
-echo "  timeout: ${EVAL_MAX_STEPS:-official task-specific 1.5x mean human length}"
+echo "  timeout: ${EVAL_MAX_STEPS:-official task-specific ${EVAL_MAX_STEPS_MULTIPLIER}x mean human length}"
 echo "  profile / write video: ${EVAL_PROFILE} / ${EVAL_WRITE_VIDEO}"
 echo "  official dynamics: physics=120 Hz, render/action=30 Hz"
 echo "  GPUs: ${GPU_ID_LIST[*]}"

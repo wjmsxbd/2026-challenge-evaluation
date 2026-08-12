@@ -167,9 +167,10 @@ class Evaluator:
         cfg["robots"] = [robot_cfg]
 
         if self.cfg.max_steps is None:
-            max_steps = int(self.human_stats["length"] * EVAL_TIMEOUT_MULTIPLIER)
+            max_steps_multiplier = float(self.cfg.get("max_steps_multiplier", EVAL_TIMEOUT_MULTIPLIER))
+            max_steps = int(self.human_stats["length"] * max_steps_multiplier)
             logger.info(
-                f"Setting timeout to be {EVAL_TIMEOUT_MULTIPLIER}x the average length of human demos: {max_steps}"
+                f"Setting timeout to be {max_steps_multiplier}x the average length of human demos: {max_steps}"
             )
             cfg["task"]["termination_config"]["max_steps"] = max_steps
         else:
