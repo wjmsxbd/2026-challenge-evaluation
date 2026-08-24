@@ -62,7 +62,7 @@ policy config:    pi_behavior_b1k_2026
 
 `run_pi05_behavior_2026_eval_chunk.sh` 使用共享动态任务队列：空闲 worker 领取下一个 task，结构简单。
 
-`run_pi05_behavior_2026_eval_chunk_balance.sh` 使用 LPT 风格的预均衡调度：根据各任务 timeout 和 instance group 数估算计算量，将长任务分散到不同 GPU，再让每个 worker 按自己的队列运行。多卡运行后 50 个任务时推荐使用这个版本，可以减少最后等待少量长任务的尾部时间。
+`run_pi05_behavior_2026_eval_chunk_balance.sh` 使用在线的最长任务优先调度：根据各任务 timeout step 和 instance chunk 数生成共享队列，所有 worker 在完成当前 chunk 后加锁领取队首任务。这样不同 GPU 会按实际完成速度动态获取后续任务，减少离线分配造成的尾部等待。
 
 ## Batch-2 推理
 

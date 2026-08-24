@@ -9,6 +9,8 @@ set -euo pipefail
 #   - one rollout per instance
 #   - official 120/30/30 Hz dynamics and task-specific 1.5x human timeout
 #   - one persistent policy server + one two-slot VectorEnvironment per GPU
+#   - instance-pair chunks are the scheduling units; chunks from one task may run
+#     concurrently on different GPUs and are merged into the official task output
 #   - one policy request containing both environments per synchronized inference step
 #
 # The default throughput profile disables MP4 encoding. For submission-complete
@@ -26,16 +28,20 @@ BEHAVIOR_ROOT="${BEHAVIOR_ROOT:-${SCRIPT_DIR}}"
 PI05_REPO="${PI05_REPO:-/mnt/data_nas/wangjm/unirobot/behavior-1k-solution}"
 PI05_SERVER_SCRIPT="${PI05_SERVER_SCRIPT:-${BEHAVIOR_ROOT}/serve_pi05_behavior_2026_vector.py}"
 PI05_POLICY_CONFIG="${PI05_POLICY_CONFIG:-pi_behavior_b1k_2026}"
-PI05_POLICY_DIR="${PI05_POLICY_DIR:-/mnt/data/ckpt/[b1k]/pi_behavior_b1k_2026/20260730_b1k_2026_full_fast_8gpu_bs2048/18000}"
+PI05_POLICY_DIR="${PI05_POLICY_DIR:-/mnt/data/ckpt/[b1k]/pi_behavior_b1k_2026/20260730_b1k_2026_full_fast_8gpu_bs2048/44000}"
 PI05_INFERENCE_CKPT_SUFFIX="${PI05_INFERENCE_CKPT_SUFFIX:-_inference}"
 PI05_AUTO_CONVERT_CKPT="${PI05_AUTO_CONVERT_CKPT:-true}"
 PI05_CONVERT_SCRIPT="${PI05_CONVERT_SCRIPT:-${PI05_REPO}/scripts/merge_sharded_params_for_inference.py}"
 PI05_NORM_STATS_PATH="${PI05_NORM_STATS_PATH:-${PI05_REPO}/outputs/assets/pi_behavior_b1k_2026/behavior-1k/2026-challenge-demos/norm_stats.json}"
 PI05_TASK_CHECKPOINT_MAPPING="${PI05_TASK_CHECKPOINT_MAPPING:-${PI05_REPO}/task_checkpoint_mapping.json}"
 USE_PI05_TASK_CHECKPOINT_MAPPING="${USE_PI05_TASK_CHECKPOINT_MAPPING:-false}"
-PI05_ENV_DIR="${PI05_ENV_DIR:-${PI05_UV_PROJECT_ENVIRONMENT:-${HOME}/pi05_env}}"
+# The PI0.5 policy server runs from the solution checkout's managed venv by
+# default. Override PI05_ENV_DIR / PI05_PYTHON when using another environment.
+PI05_ENV_DIR="${PI05_ENV_DIR:-${PI05_REPO}/.venv}"
 PI05_PYTHON="${PI05_PYTHON:-${PI05_ENV_DIR}/bin/python}"
-BEHAVIOR_ENV_DIR="${BEHAVIOR_ENV_DIR:-/root/miniconda3/envs/behavior_2026}"
+# Use the NAS-backed evaluator environment by default. Override
+# BEHAVIOR_ENV_DIR explicitly when running on another host.
+BEHAVIOR_ENV_DIR="${BEHAVIOR_ENV_DIR:-/mnt/data_nas/wangjm/miniconda3/envs/behavior_2026}"
 BEHAVIOR_PYTHON="${BEHAVIOR_PYTHON:-${BEHAVIOR_ENV_DIR}/bin/python}"
 OMNIGIBSON_DATA_PATH="${OMNIGIBSON_DATA_PATH:-${BEHAVIOR_ROOT}/datasets}"
 TASK_STATS_FILE="${TASK_STATS_FILE:-${OMNIGIBSON_DATA_PATH}/2026-challenge-task-instances/metadata/task.jsonl}"
@@ -53,6 +59,9 @@ NUM_GPUS="${NUM_GPUS:-8}"
 GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 GPU_IDS="${GPU_IDS//,/ }"
 VECTOR_ENVS_PER_PROCESS="${VECTOR_ENVS_PER_PROCESS:-2}"
+# Number of public instances in one scheduled evaluator process. Keeping this
+# equal to VECTOR_ENVS_PER_PROCESS preserves synchronized batch-2 inference.
+INSTANCE_CHUNK_SIZE="${INSTANCE_CHUNK_SIZE:-${VECTOR_ENVS_PER_PROCESS}}"
 PORT_BASE="${PORT_BASE:-7100}"
 PORT_STRIDE="${PORT_STRIDE:-100}"
 PI05_SERVER_HOST="${PI05_SERVER_HOST:-localhost}"
@@ -100,7 +109,10 @@ EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_outputs
 RUN_OUTPUT_ROOT="${EVAL_LOG_ROOT}/${RUN_TS}"
 QUEUE_FILE="${LOG_DIR}/task_queue.tsv"
 QUEUE_DIR="${LOG_DIR}/task_queues"
+ONLINE_QUEUE_FILE="${QUEUE_DIR}/online.tsv"
+CHUNK_RESULTS_FILE="${LOG_DIR}/chunk_results.tsv"
 SCHEDULE_FILE="${LOG_DIR}/task_schedule.tsv"
+ASSIGNMENTS_FILE="${LOG_DIR}/task_assignments.tsv"
 RESULTS_FILE="${LOG_DIR}/results.tsv"
 ATTEMPTS_FILE="${LOG_DIR}/attempts.tsv"
 PID_DIR="${LOG_DIR}/pids"
@@ -126,6 +138,7 @@ Core overrides:
   EVAL_MAX_STEPS_MULTIPLIER Multiplier applied to mean human-demo length, default 1.5.
   EVAL_MAX_TASK_ATTEMPTS    Whole-task attempts before terminal failure, default 2.
   GPU_IDS / NUM_GPUS        GPU IDs and number of colocated env/server pairs.
+  INSTANCE_CHUNK_SIZE       Instances per scheduled chunk, defaulting to the vector-env count (2).
   TASK_STATS_FILE           Per-task human statistics used for load balancing.
   PI05_REPO                 100-task PI0.5 source checkout; must contain champion_2026 config.
   PI05_POLICY_DIR           Training or merged inference checkpoint directory.
@@ -133,9 +146,13 @@ Core overrides:
   PI05_CONVERT_SCRIPT       Sharded-checkpoint merge script.
   PI05_NORM_STATS_PATH      2026 checkpoint normalization statistics.
   PI05_BASE_VELOCITY_FRAME  Policy observation base qvel frame: absolute (legacy raw) or relative (robot-local), default absolute. Actions are always robot-local.
-  PI05_ENV_DIR              PI0.5 environment directory, default ~/pi05_env.
+  PI05_ENV_DIR              PI0.5 environment directory, default ${PI05_REPO}/.venv.
   BEHAVIOR_ENV_DIR          2026 evaluator conda environment directory.
   LOG_DIR / EVAL_LOG_ROOT   Scheduler logs and evaluator outputs.
+
+The scheduler builds one shared online chunk queue. Chunks are ordered by
+estimated task timeout steps (longest first); each worker claims the next
+available chunk only after finishing its current chunk.
 
 The default checkpoint is the 100-task 2026 PI_BEHAVIOR checkpoint. If the
 requested training checkpoint is sharded, an existing sibling ending in
@@ -370,6 +387,7 @@ validate_environment() {
   require_command setsid
   validate_positive_int NUM_GPUS "${NUM_GPUS}"
   validate_positive_int VECTOR_ENVS_PER_PROCESS "${VECTOR_ENVS_PER_PROCESS}"
+  validate_positive_int INSTANCE_CHUNK_SIZE "${INSTANCE_CHUNK_SIZE}"
   validate_positive_int PI05_DYNAMIC_BATCH_MAX_SIZE "${PI05_DYNAMIC_BATCH_MAX_SIZE}"
   validate_positive_int PI05_DYNAMIC_BATCH_GRANULARITY "${PI05_DYNAMIC_BATCH_GRANULARITY}"
   validate_positive_int TASK_LIMIT "${TASK_LIMIT}"
@@ -388,6 +406,10 @@ validate_environment() {
 
   (( VECTOR_ENVS_PER_PROCESS == 2 )) || {
     echo "This launcher requires VECTOR_ENVS_PER_PROCESS=2 for synchronized two-env simulation." >&2
+    exit 1
+  }
+  (( INSTANCE_CHUNK_SIZE <= VECTOR_ENVS_PER_PROCESS )) || {
+    echo "INSTANCE_CHUNK_SIZE cannot exceed VECTOR_ENVS_PER_PROCESS." >&2
     exit 1
   }
   (( PI05_DYNAMIC_BATCH_MAX_SIZE == 2 && PI05_DYNAMIC_BATCH_GRANULARITY == 1 )) || {
@@ -482,18 +504,20 @@ build_task_queue() {
   mkdir -p "${QUEUE_DIR}"
   SELECTED_TASK_IDS="${TASK_IDS}" TASK_LIMIT_VALUE="${TASK_LIMIT}" \
     NUM_SCHEDULER_SLOTS="${NUM_GPUS}" INSTANCE_COUNT_VALUE="${#INSTANCE_INDEX_LIST[@]}" \
-    VECTOR_ENVS_VALUE="${VECTOR_ENVS_PER_PROCESS}" MAX_STEPS_OVERRIDE="${EVAL_MAX_STEPS}" \
+    INSTANCE_INDICES_VALUE="${INSTANCE_INDEX_LIST[*]}" \
+    VECTOR_ENVS_VALUE="${VECTOR_ENVS_PER_PROCESS}" INSTANCE_CHUNK_SIZE_VALUE="${INSTANCE_CHUNK_SIZE}" \
+    MAX_STEPS_OVERRIDE="${EVAL_MAX_STEPS}" \
     MAX_STEPS_MULTIPLIER="${EVAL_MAX_STEPS_MULTIPLIER}" \
     python3 - \
       "${OMNIGIBSON_DATA_PATH}/2026-challenge-task-instances/metadata/B100_task_misc.csv" \
-      "${TASK_STATS_FILE}" "${QUEUE_FILE}" "${QUEUE_DIR}" "${SCHEDULE_FILE}" <<'PY'
+      "${TASK_STATS_FILE}" "${QUEUE_FILE}" "${ONLINE_QUEUE_FILE}" "${SCHEDULE_FILE}" <<'PY'
 import csv
 import json
 import math
 import os
 import sys
 
-metadata_path, stats_path, output_path, queue_dir, schedule_path = sys.argv[1:]
+metadata_path, stats_path, output_path, online_queue_path, schedule_path = sys.argv[1:]
 with open(metadata_path, newline="", encoding="utf-8") as file:
     tasks = {int(row["Task ID"]): row["Task"] for row in csv.DictReader(file)}
 with open(stats_path, encoding="utf-8") as file:
@@ -519,12 +543,17 @@ if missing_stats:
 
 num_slots = int(os.environ["NUM_SCHEDULER_SLOTS"])
 instance_count = int(os.environ["INSTANCE_COUNT_VALUE"])
+instance_indices = [int(value) for value in os.environ["INSTANCE_INDICES_VALUE"].split()]
 vector_envs = int(os.environ["VECTOR_ENVS_VALUE"])
+chunk_size = int(os.environ["INSTANCE_CHUNK_SIZE_VALUE"])
 max_steps_override = os.environ.get("MAX_STEPS_OVERRIDE", "")
 max_steps_multiplier = float(os.environ["MAX_STEPS_MULTIPLIER"])
-if num_slots <= 0 or instance_count <= 0 or vector_envs <= 0:
+if num_slots <= 0 or instance_count <= 0 or vector_envs <= 0 or chunk_size <= 0:
     raise SystemExit("Scheduler slots, instance count, and vector env count must be positive")
-groups_per_task = math.ceil(instance_count / vector_envs)
+if len(instance_indices) != instance_count:
+    raise SystemExit("INSTANCE_INDICES_VALUE does not match INSTANCE_COUNT_VALUE")
+if chunk_size > vector_envs:
+    raise SystemExit("INSTANCE_CHUNK_SIZE cannot exceed VECTOR_ENVS_PER_PROCESS")
 
 scheduled_tasks = []
 for selection_order, task_id in enumerate(selected_ids):
@@ -534,44 +563,46 @@ for selection_order, task_id in enumerate(selected_ids):
         timeout_steps = int(float(stats[task_id]["length"]) * max_steps_multiplier)
     if timeout_steps <= 0:
         raise SystemExit(f"Estimated timeout must be positive for task ID {task_id}, got {timeout_steps}")
-    scheduled_tasks.append(
-        {
-            "task_id": task_id,
-            "task_name": tasks[task_id],
-            "timeout_steps": timeout_steps,
-            "estimated_slot_steps": timeout_steps * groups_per_task,
-            "selection_order": selection_order,
-        }
-    )
+    for chunk_number, start in enumerate(range(0, instance_count, chunk_size)):
+        chunk_indices = instance_indices[start : start + chunk_size]
+        scheduled_tasks.append(
+            {
+                "task_id": task_id,
+                "task_name": tasks[task_id],
+                "instance_indices": chunk_indices,
+                "timeout_steps": timeout_steps,
+                "estimated_slot_steps": timeout_steps * len(chunk_indices),
+                "chunk_steps": timeout_steps * len(chunk_indices),
+                "selection_order": (selection_order, chunk_number),
+            }
+        )
 
-# Use longest-processing-time-first assignment to put each next-longest task on
-# the currently lightest GPU worker, balancing the official timeout budget.
-slot_loads = [0] * num_slots
-slot_tasks = [[] for _ in range(num_slots)]
-for task in sorted(scheduled_tasks, key=lambda item: (-item["estimated_slot_steps"], item["selection_order"])):
-    slot = min(range(num_slots), key=lambda index: (slot_loads[index], len(slot_tasks[index]), index))
-    slot_tasks[slot].append(task)
-    slot_loads[slot] += task["estimated_slot_steps"]
+# Online scheduling queue: longest estimated task-step chunks first.  Workers
+# claim from this one shared file at runtime, so faster GPUs naturally receive
+# more work instead of being constrained by an offline per-GPU assignment.
+ordered_tasks = sorted(scheduled_tasks, key=lambda item: (-item["timeout_steps"], item["selection_order"]))
 
 with open(output_path, "w", encoding="utf-8") as file:
-    for task_id in selected_ids:
+    for task_id in sorted(selected_ids, key=lambda task_id: (-int(float(stats[task_id]["length"]) * max_steps_multiplier) if not max_steps_override else -int(max_steps_override), task_id)):
         file.write(f"{task_id}\t{tasks[task_id]}\n")
 
-queue_root = os.path.abspath(queue_dir)
-os.makedirs(queue_root, exist_ok=True)
+os.makedirs(os.path.dirname(os.path.abspath(online_queue_path)), exist_ok=True)
+with open(online_queue_path, "w", encoding="utf-8") as queue_file:
+    for order, task in enumerate(ordered_tasks, start=1):
+        indices_text = ",".join(str(index) for index in task["instance_indices"])
+        queue_file.write(
+            f'{task["task_id"]}\t{task["task_name"]}\t{indices_text}\t'
+            f'{task["timeout_steps"]}\t{task["chunk_steps"]}\t{order}\n'
+        )
+
 with open(schedule_path, "w", encoding="utf-8") as schedule_file:
-    schedule_file.write("slot\tposition\ttask_id\ttask_name\ttimeout_steps\testimated_slot_steps\n")
-    for slot, assigned_tasks in enumerate(slot_tasks):
-        queue_path = os.path.join(queue_root, f"worker_{slot}.tsv")
-        with open(queue_path, "w", encoding="utf-8") as queue_file:
-            # Assignment is balanced with LPT, then each worker queue is
-            # reversed so shorter tasks produce results first.
-            for position, task in enumerate(reversed(assigned_tasks), start=1):
-                queue_file.write(f'{task["task_id"]}\t{task["task_name"]}\n')
-                schedule_file.write(
-                    f'{slot}\t{position}\t{task["task_id"]}\t{task["task_name"]}\t'
-                    f'{task["timeout_steps"]}\t{task["estimated_slot_steps"]}\n'
-                )
+    schedule_file.write("order\tworker\ttask_id\ttask_name\tinstance_indices\ttimeout_steps\tchunk_steps\testimated_steps\tspeed_source\n")
+    for order, task in enumerate(ordered_tasks, start=1):
+        indices_text = ",".join(str(index) for index in task["instance_indices"])
+        schedule_file.write(
+            f'{order}\tpending\t{task["task_id"]}\t{task["task_name"]}\t{indices_text}\t'
+            f'{task["timeout_steps"]}\t{task["chunk_steps"]}\t{task["chunk_steps"]}\tstep_lpt_online\n'
+        )
 PY
 }
 
@@ -594,8 +625,8 @@ find_free_port() {
 
 pop_next_task() {
   local worker="$1" line status
-  local worker_queue="${QUEUE_DIR}/worker_${worker}.tsv"
-  local worker_lock="${QUEUE_DIR}/worker_${worker}.lock"
+  local worker_queue="${ONLINE_QUEUE_FILE}"
+  local worker_lock="${QUEUE_DIR}/online.lock"
   set +e
   line="$(
     {
@@ -611,6 +642,16 @@ pop_next_task() {
   set -e
   (( status == 0 )) && [[ -n "${line}" ]] || return 1
   echo "${line}"
+}
+
+record_assignment() {
+  local worker="$1" gpu="$2" task_id="$3" task_name="$4" chunk_indices="$5" timeout_steps="$6" chunk_steps="$7" order="$8" position="$9"
+  {
+    flock -x 9
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu}" "${position}" "${order}" \
+      "${task_id}" "${task_name}" "${chunk_indices}" "${timeout_steps}" >>"${ASSIGNMENTS_FILE}"
+  } 9>"${ASSIGNMENTS_FILE}.lock"
 }
 
 kill_process_group() {
@@ -682,14 +723,16 @@ wait_for_server() {
 }
 
 launch_eval() {
-  local gpu_id="$1" worker="$2" port="$3" task_name="$4" output_dir="$5" log_file="$6"
+  local gpu_id="$1" worker="$2" port="$3" task_name="$4" output_dir="$5" log_file="$6" instance_indices="$7"
+  local -a chunk_indices
+  read -r -a chunk_indices <<<"${instance_indices//,/ }"
   local -a args=(
     -m omnigibson.eval.eval_vector
     --task-name "${task_name}"
     --host "${PI05_CLIENT_HOST}"
     --port "${port}"
     --mode public_test
-    --instance-indices "${INSTANCE_INDEX_LIST[@]}"
+    --instance-indices "${chunk_indices[@]}"
     --num-rollouts 1
     --num-envs "${VECTOR_ENVS_PER_PROCESS}"
     --seed "${EVAL_SEED}"
@@ -738,6 +781,18 @@ launch_eval() {
   LAUNCHED_PID="$!"
 }
 
+validate_chunk_artifacts() {
+  local task_name="$1" chunk_indices="$2" attempt_dir="$3"
+  local -a indices
+  read -r -a indices <<<"${chunk_indices//,/ }"
+  [[ -f "${attempt_dir}/evaluation_complete.json" && -d "${attempt_dir}/json" ]] || return 1
+  local index json_file
+  for index in "${indices[@]}"; do
+    json_file="${attempt_dir}/json/${task_name}_$((301 + index))_0.json"
+    [[ -f "${json_file}" ]] || return 1
+  done
+}
+
 record_result() {
   local state="$1" worker="$2" gpu="$3" task_id="$4" task_name="$5" status="$6" output_dir="$7"
   {
@@ -770,21 +825,26 @@ log_has_fatal_error() {
 
 worker_loop() {
   local worker="$1" gpu_id="$2" port="$3" server_pid="$4"
-  local task_line task_id task_name output_dir attempt_parent attempt_dir log_file validation_log
+  local task_line task_id task_name chunk_indices timeout_steps chunk_steps queue_order output_dir attempt_parent attempt_dir log_file validation_log
+  local assignment_position=0
   local eval_pid eval_status validation_status fatal_detected promoted terminal_status attempt task_succeeded
   while task_line="$(pop_next_task "${worker}")"; do
-    IFS=$'\t' read -r task_id task_name <<<"${task_line}"
-    output_dir="${RUN_OUTPUT_ROOT}/task-${task_id}_${task_name}"
-    attempt_parent="${ATTEMPTS_ROOT}/task-${task_id}_${task_name}"
+    IFS=$'\t' read -r task_id task_name chunk_indices timeout_steps chunk_steps queue_order <<<"${task_line}"
+    assignment_position=$((assignment_position + 1))
+    record_assignment "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${chunk_indices}" \
+      "${timeout_steps}" "${chunk_steps}" "${queue_order}" "${assignment_position}"
+    output_dir="${RUN_OUTPUT_ROOT}/.chunks/task-${task_id}_${task_name}/instances-${chunk_indices//,/_}"
+    mkdir -p "$(dirname "${output_dir}")"
+    attempt_parent="${ATTEMPTS_ROOT}/task-${task_id}_${task_name}/instances-${chunk_indices//,/_}"
     mkdir -p "${attempt_parent}"
     task_succeeded=false
     terminal_status=124
 
     for ((attempt = 1; attempt <= EVAL_MAX_TASK_ATTEMPTS; attempt++)); do
       attempt_dir="${attempt_parent}/attempt-${attempt}"
-      log_file="${LOG_DIR}/eval_worker${worker}_gpu${gpu_id}_task${task_id}_${task_name}_attempt${attempt}.log"
-      validation_log="${LOG_DIR}/validate_worker${worker}_task${task_id}_${task_name}_attempt${attempt}.log"
-      echo "[worker ${worker}/gpu${gpu_id}] task=${task_id}:${task_name} attempt=${attempt}/${EVAL_MAX_TASK_ATTEMPTS} instances=${INSTANCE_INDEX_LIST[*]}"
+      log_file="${LOG_DIR}/eval_worker${worker}_gpu${gpu_id}_task${task_id}_${task_name}_instances-${chunk_indices//,/_}_attempt${attempt}.log"
+      validation_log="${LOG_DIR}/validate_worker${worker}_task${task_id}_${task_name}_instances-${chunk_indices//,/_}_attempt${attempt}.log"
+      echo "[worker ${worker}/gpu${gpu_id}] task=${task_id}:${task_name} chunk=${chunk_indices} attempt=${attempt}/${EVAL_MAX_TASK_ATTEMPTS}"
 
       if [[ -e "${attempt_dir}" || -e "${output_dir}" ]]; then
         echo "Refusing to overwrite existing task output: ${attempt_dir} or ${output_dir}" >"${validation_log}"
@@ -794,7 +854,7 @@ worker_loop() {
         break
       fi
 
-      launch_eval "${gpu_id}" "${worker}" "${port}" "${task_name}" "${attempt_dir}" "${log_file}"
+      launch_eval "${gpu_id}" "${worker}" "${port}" "${task_name}" "${attempt_dir}" "${log_file}" "${chunk_indices}"
       eval_pid="${LAUNCHED_PID}"
       echo "${eval_pid}" >"${PID_DIR}/eval_worker${worker}.pid"
       set +e
@@ -803,9 +863,7 @@ worker_loop() {
       set -e
       rm -f "${PID_DIR}/eval_worker${worker}.pid"
 
-      if python3 "${OUTPUT_VALIDATOR}" validate-task \
-        --manifest "${RUN_MANIFEST}" --task-id "${task_id}" --task-dir "${attempt_dir}" \
-        >"${validation_log}" 2>&1; then
+      if validate_chunk_artifacts "${task_name}" "${chunk_indices}" "${attempt_dir}" >"${validation_log}" 2>&1; then
         validation_status=0
       else
         validation_status=$?
@@ -835,7 +893,12 @@ worker_loop() {
         "${attempt_dir}" "${output_dir}" "${log_file}" "${validation_log}"
 
       if [[ "${task_succeeded}" == true ]]; then
-        record_result ok "${worker}" "${gpu_id}" "${task_id}" "${task_name}" 0 "${output_dir}"
+        {
+          flock -x 9
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${chunk_indices}" \
+            >>"${CHUNK_RESULTS_FILE}"
+        } 9>"${CHUNK_RESULTS_FILE}.lock"
         break
       fi
       echo "[worker ${worker}] task ${task_id}:${task_name} attempt ${attempt} failed; see ${log_file} and ${validation_log}" >&2
@@ -882,6 +945,8 @@ INSTANCE_COUNT="${#INSTANCE_INDEX_LIST[@]}"
 EXPECTED_RESULTS=$((TASK_COUNT * INSTANCE_COUNT))
 printf 'timestamp\tstate\tworker\tgpu\ttask_id\ttask_name\tstatus\toutput_dir\n' >"${RESULTS_FILE}"
 printf 'timestamp\tworker\tgpu\ttask_id\ttask_name\tattempt\tevaluator_status\tvalidation_status\tfatal_log\tpromoted\tattempt_dir\tfinal_dir\tlogs\n' >"${ATTEMPTS_FILE}"
+printf 'timestamp\tworker\tgpu\ttask_id\ttask_name\tinstance_indices\n' >"${CHUNK_RESULTS_FILE}"
+printf 'timestamp\tworker\tgpu\tworker_position\tqueue_order\ttask_id\ttask_name\tinstance_indices\ttimeout_steps\n' >"${ASSIGNMENTS_FILE}"
 manifest_video_arg=--no-write-video
 [[ "${EVAL_WRITE_VIDEO}" == true ]] && manifest_video_arg=--write-video
 python3 "${OUTPUT_VALIDATOR}" create-manifest \
@@ -904,10 +969,9 @@ echo "  profile / write video: ${EVAL_PROFILE} / ${EVAL_WRITE_VIDEO}"
 echo "  official dynamics: physics=120 Hz, render/action=30 Hz"
 echo "  GPUs: ${GPU_ID_LIST[*]}"
 echo "  topology: 1 persistent server + 1 Isaac Sim process x ${VECTOR_ENVS_PER_PROCESS} vector envs per GPU; joint batch-2 policy requests"
-echo "  scheduler: LPT-balanced across ${NUM_GPUS} GPU slots, shortest task first within each slot"
-awk -F '\t' 'NR > 1 {load[$1] += $6; count[$1]++} END {
-  for (slot = 0; slot < '"${NUM_GPUS}"'; slot++)
-    printf "    slot %d: tasks=%d estimated_steps=%d\n", slot, count[slot] + 0, load[slot] + 0
+echo "  scheduler: online longest-task-first by estimated timeout steps at instance-chunk granularity (${INSTANCE_CHUNK_SIZE} instances/chunk)"
+awk -F '\t' 'NR > 1 {steps += $7; count++} END {
+  printf "    pending chunks=%d estimated_steps=%d\n", count + 0, steps + 0
 }' "${SCHEDULE_FILE}"
 echo "  dynamic batch max/wait/granularity: ${PI05_DYNAMIC_BATCH_MAX_SIZE}/${PI05_DYNAMIC_BATCH_WAIT_MS}ms/${PI05_DYNAMIC_BATCH_GRANULARITY}"
 echo "  CPU cores/threads per evaluator: ${EVAL_CPU_CORES}/${EVAL_CPU_NUM_THREADS}"
@@ -935,7 +999,7 @@ echo "  logs: ${LOG_DIR}"
 
 if [[ "${DRY_RUN}" == true ]]; then
   echo
-  echo "Dry-run balanced task schedule:"
+  echo "Dry-run online longest-task-first schedule:"
   cat "${SCHEDULE_FILE}"
   echo "Dry run complete; no server or simulator process was started."
   exit 0
@@ -976,6 +1040,66 @@ overall_status=0
 for worker_pid in "${WORKER_PIDS[@]}"; do
   wait "${worker_pid}" || overall_status=1
 done
+
+# Reassemble chunk outputs into the official one-directory-per-task layout.
+# Each chunk was validated for its own instance subset above; the normal global
+# validator below then checks the merged task against the full manifest.
+if (( overall_status == 0 )); then
+  python3 - "${QUEUE_FILE}" "${RUN_OUTPUT_ROOT}" "${INSTANCE_INDEX_LIST[*]}" "${EVAL_WRITE_VIDEO}" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+queue_file, run_root_text, all_indices_text, write_video_text = sys.argv[1:]
+run_root = Path(run_root_text)
+all_indices = [int(value) for value in all_indices_text.split()]
+write_video = write_video_text == "true"
+chunks_root = run_root / ".chunks"
+for line in Path(queue_file).read_text(encoding="utf-8").splitlines():
+    task_id_text, task_name = line.split("\t", 1)
+    task_id = int(task_id_text)
+    task_prefix = f"task-{task_id}_{task_name}"
+    chunk_dirs = sorted((chunks_root / task_prefix).glob("instances-*"))
+    if not chunk_dirs:
+        raise SystemExit(f"no chunk outputs found for {task_prefix}")
+    final_dir = run_root / task_prefix
+    final_dir.mkdir(parents=True, exist_ok=False)
+    (final_dir / "json").mkdir()
+    if write_video:
+        (final_dir / "videos").mkdir()
+    seen = set()
+    for chunk in chunk_dirs:
+        for source_dir_name in ("json", "videos") if write_video else ("json",):
+            source_dir = chunk / source_dir_name
+            if not source_dir.is_dir():
+                continue
+            target_dir = final_dir / source_dir_name
+            for source in source_dir.iterdir():
+                if source.name in seen:
+                    raise SystemExit(f"duplicate merged artifact {source.name} for {task_prefix}")
+                seen.add(source.name)
+                shutil.copy2(source, target_dir / source.name)
+    expected_json = {f"{task_name}_{301 + index}_0.json" for index in all_indices}
+    actual_json = {path.name for path in (final_dir / "json").glob("*.json")}
+    if actual_json != expected_json:
+        raise SystemExit(f"merged JSON mismatch for {task_prefix}: expected {expected_json}, got {actual_json}")
+    marker = {
+        "task": task_name,
+        "task_id": task_id,
+        "mode": "public_test",
+        "instance_ids": [301 + index for index in all_indices],
+        "num_rollouts": 1,
+        "num_vector_envs": 2,
+        "result_count": len(all_indices),
+        "write_video": write_video,
+    }
+    (final_dir / "evaluation_complete.json").write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+PY
+  while IFS=$'\t' read -r task_id task_name; do
+    record_result ok "-" "-" "${task_id}" "${task_name}" 0 "${RUN_OUTPUT_ROOT}/task-${task_id}_${task_name}"
+  done <"${QUEUE_FILE}"
+fi
 
 trap - INT TERM EXIT
 cleanup
