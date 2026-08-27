@@ -43,6 +43,7 @@ PI05_PYTHON="${PI05_PYTHON:-${PI05_ENV_DIR}/bin/python}"
 # BEHAVIOR_ENV_DIR explicitly when running on another host.
 BEHAVIOR_ENV_DIR="${BEHAVIOR_ENV_DIR:-/mnt/data_nas/wangjm/miniconda3/envs/behavior_2026}"
 BEHAVIOR_PYTHON="${BEHAVIOR_PYTHON:-${BEHAVIOR_ENV_DIR}/bin/python}"
+DRIVER_FIX_SCRIPT="${DRIVER_FIX_SCRIPT:-${HOME}/driver_fix/activate.sh}"
 OMNIGIBSON_DATA_PATH="${OMNIGIBSON_DATA_PATH:-${BEHAVIOR_ROOT}/datasets}"
 TASK_STATS_FILE="${TASK_STATS_FILE:-${OMNIGIBSON_DATA_PATH}/2026-challenge-task-instances/metadata/task.jsonl}"
 PI05_RESOLVED_POLICY_DIR=""
@@ -148,6 +149,7 @@ Core overrides:
   PI05_BASE_VELOCITY_FRAME  Policy observation base qvel frame: absolute (legacy raw) or relative (robot-local), default absolute. Actions are always robot-local.
   PI05_ENV_DIR              PI0.5 environment directory, default ${PI05_REPO}/.venv.
   BEHAVIOR_ENV_DIR          2026 evaluator conda environment directory.
+  DRIVER_FIX_SCRIPT         Script sourced before every evaluator attempt, default ~/driver_fix/activate.sh.
   LOG_DIR / EVAL_LOG_ROOT   Scheduler logs and evaluator outputs.
 
 The scheduler builds one shared online chunk queue. Chunks are ordered by
@@ -419,6 +421,10 @@ validate_environment() {
   [[ -x "${PI05_PYTHON}" ]] || { echo "PI05_PYTHON is not executable: ${PI05_PYTHON}" >&2; exit 1; }
   [[ -x "${BEHAVIOR_PYTHON}" ]] || {
     echo "BEHAVIOR_PYTHON is not executable: ${BEHAVIOR_PYTHON}" >&2
+    exit 1
+  }
+  [[ -r "${DRIVER_FIX_SCRIPT}" ]] || {
+    echo "GPU driver activation script is not readable: ${DRIVER_FIX_SCRIPT}" >&2
     exit 1
   }
   [[ -f "${PI05_SERVER_SCRIPT}" ]] || { echo "PI0.5 vector server is missing: ${PI05_SERVER_SCRIPT}" >&2; exit 1; }
@@ -758,9 +764,18 @@ launch_eval() {
     behavior_env_dir="$(dirname "$(dirname "${BEHAVIOR_PYTHON}")")"
     conda_root="$(dirname "$(dirname "${behavior_env_dir}")")"
     set +u
+    source "${DRIVER_FIX_SCRIPT}"
     source "${conda_root}/etc/profile.d/conda.sh"
     conda activate "${behavior_env_dir}"
     set -u
+    gpu_inventory=""
+    if ! command -v nvidia-smi >/dev/null 2>&1 \
+      || ! gpu_inventory="$(nvidia-smi -L)" \
+      || ! grep -Fq "GPU ${gpu_id}:" <<<"${gpu_inventory}"; then
+      echo "GPU ${gpu_id} is unavailable after sourcing ${DRIVER_FIX_SCRIPT}" >&2
+      [[ -z "${gpu_inventory}" ]] || printf '%s\n' "${gpu_inventory}" >&2
+      exit 127
+    fi
     cd "${BEHAVIOR_ROOT}"
     exec env \
       OMP_NUM_THREADS="${EVAL_CPU_NUM_THREADS}" \
@@ -989,6 +1004,7 @@ echo "  proprioception schema: ${PI05_PROPRIOCEPTION_SCHEMA}"
 echo "  base velocity frame: ${PI05_BASE_VELOCITY_FRAME}"
 echo "  environment seed: ${EVAL_SEED}"
 echo "  behavior env: ${BEHAVIOR_ENV_DIR}"
+echo "  GPU driver activation: ${DRIVER_FIX_SCRIPT} (sourced before every evaluator attempt)"
 echo "  PI0.5 env: ${PI05_ENV_DIR}"
 echo "  behavior Python: ${BEHAVIOR_PYTHON}"
 echo "  PI0.5 Python: ${PI05_PYTHON}"

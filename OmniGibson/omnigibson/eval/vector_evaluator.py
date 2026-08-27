@@ -147,6 +147,8 @@ def _plain_dict(value: Any) -> dict | None:
 
 def _atomic_json_dump(data: Any, output_path: Path, **dump_kwargs: Any) -> None:
     """Write JSON through a same-directory temporary file and atomically replace the target."""
+    # SPEEDUP_EVAL: never expose a half-written metric marker to the scheduler or
+    # output validator if the evaluator is interrupted during a large run.
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -224,7 +226,8 @@ class VectorChunkEvaluator:
         self.num_envs = int(cfg.num_envs)
         self.task_id = int(cfg.task.id)
         self.task_name = str(cfg.task.name)
-        # Keep both synchronized vector environments on the exact same seed.
+        # SPEEDUP_EVAL: keep both synchronized vector environments on the exact
+        # same seed so slot assignment does not change the rollout RNG stream.
         # This intentionally mirrors the server's fixed JAX seed (0) and makes
         # each group reset reproducible independent of its slot.
         self.env_seeds = [0 for _ in range(self.num_envs)]
@@ -252,6 +255,8 @@ class VectorChunkEvaluator:
         ]
 
         env_config = self._build_environment_config()
+        # SPEEDUP_EVAL: create all slots inside one Isaac Sim process; policy
+        # requests and simulator ticks are shared by the active slots below.
         self.vector_env = og.VectorEnvironment(self.num_envs, env_config, seeds=self.env_seeds)
         self.envs = self.vector_env.envs
         for env in self.envs:
@@ -293,6 +298,8 @@ class VectorChunkEvaluator:
             raise ValueError(f"Unknown BEHAVIOR task: {self.task_name}")
         task_cfg = available_tasks[self.task_name][0]
         config = generate_basic_environment_config(task_name=self.task_name, task_cfg=task_cfg)
+        # SPEEDUP_EVAL: load only rooms relevant to this activity to reduce scene
+        # construction, physics, and rendering cost without changing task objects.
         if bool(self.cfg.partial_scene_load):
             rooms = get_task_relevant_room_types(activity_name=self.task_name)
             config["scene"]["load_room_types"] = augment_rooms(rooms, task_cfg["scene_model"], self.task_name)
@@ -305,6 +312,8 @@ class VectorChunkEvaluator:
             raise ValueError("Robot config must use canonical 'model', not 'type'")
         robot_cfg["model"] = robot_cfg["model"].lower()
         self.robot_eval_config = _plain_dict(robot_cfg.pop("eval", None)) or {}
+        # SPEEDUP_EVAL: configure 224x224 before render products are created;
+        # changing an initialized camera would force a costly/destructive rebuild.
         _configure_policy_camera_resolution(robot_cfg)
         logger.info(
             "Policy camera resolution configured before sensor creation: %sx%s",
@@ -486,6 +495,8 @@ class VectorChunkEvaluator:
 
     def _park_slot(self, slot: int) -> None:
         """Stop an inactive robot from reusing its last controller goal in later global simulator steps."""
+        # SPEEDUP_EVAL: a finished slot remains in the global scene list for stable
+        # PhysX indices, so explicitly zero and sleep it while other slots continue.
         robot = self.robots[slot]
         positions = robot.get_joint_positions().clone()
         if not bool(th.isfinite(positions).all()):
@@ -504,6 +515,8 @@ class VectorChunkEvaluator:
         robot.sleep()
 
     def _load_group(self, instance_ids: list[int], rollout_id: int) -> dict[int, dict]:
+        # SPEEDUP_EVAL: reset/load a pair as one synchronized group. This avoids
+        # advancing one slot while another slot is being restored.
         slots = list(range(len(instance_ids)))
         logger.info(
             "Resetting vector group RNGs: instances=%s slot_seeds=%s",
@@ -583,6 +596,8 @@ class VectorChunkEvaluator:
             camera_poses.append(th.cat(T.relative_pose_transform(*camera_pose, *base_pose)))
         obs[f"{robot.name}::cam_rel_poses"] = th.cat(camera_poses, dim=-1)
         proprio = obs[f"{robot.name}::proprio"]
+        # SPEEDUP_EVAL: adapt the official 2026 observation layout to the legacy
+        # champion checkpoint while keeping the controller action frame separate.
         proprio = _select_policy_base_qvel(
             proprio,
             robot.get_joint_velocities()[robot.base_control_idx],
@@ -602,6 +617,8 @@ class VectorChunkEvaluator:
         return obs
 
     def _policy_obs(self, slot: int, obs: dict) -> dict:
+        # SPEEDUP_EVAL: carry stage and the retained action prefix in the request;
+        # these fields let the persistent server reproduce the champion protocol.
         request = dict(obs)
         env_step = int(self.envs[slot]._current_step)
         request["env_step"] = env_step
@@ -615,6 +632,8 @@ class VectorChunkEvaluator:
     def _infer_chunks(self, active_slots: list[int], records: dict[int, dict]) -> dict[int, np.ndarray]:
         if not active_slots:
             return {}
+        # SPEEDUP_EVAL: one observation_batch produces one model batch (normally
+        # batch-2, or batch-1 after a slot terminates).
         requests = [self._policy_obs(slot, records[slot]["obs"]) for slot in active_slots]
         states = [
             _extract_pi05_state(
@@ -693,6 +712,8 @@ class VectorChunkEvaluator:
         max_actions = max(len(chunk) for chunk in execution_chunks.values())
         request_slots = sorted(execution_chunks)
 
+        # SPEEDUP_EVAL: advance all still-active slots together, preserving the
+        # official render/observation/reward/termination path after every action.
         for action_index in range(max_actions):
             step_slots = [
                 slot for slot in request_slots if slot in active and action_index < len(execution_chunks[slot])

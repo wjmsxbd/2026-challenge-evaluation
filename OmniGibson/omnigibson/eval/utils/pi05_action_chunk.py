@@ -141,6 +141,8 @@ class B1KActionChunkPostprocessor:
         if not np.isfinite(actions).all() or not np.isfinite(current_state).all():
             raise ValueError("Action chunk and current state must contain only finite values")
 
+        # SPEEDUP_EVAL: keep the champion's task/stage-specific action correction
+        # in the evaluator, rather than coupling it to the persistent policy server.
         should_compress = self.config.execute_in_n_steps < self.config.actions_to_execute
         if self.config.apply_eval_tricks:
             apply_correction_rules, check_gripper_variation = _load_correction_functions()
@@ -178,15 +180,21 @@ class B1KActionChunkPostprocessor:
                         right_variation,
                     )
 
+        # SPEEDUP_EVAL: execute a 26-step prediction in 20 simulator actions when
+        # safe, while retaining the tail as the next inpainting prefix.
         actions_to_execute = (
             self.config.actions_to_execute if should_compress else self.config.execute_in_n_steps
         )
         inpainting_end = actions_to_execute + self.config.actions_to_keep
+        # SPEEDUP_EVAL: carry the chunk tail into the next request so consecutive
+        # batched inferences remain temporally continuous.
         if self.config.actions_to_keep and len(actions) >= inpainting_end:
             self.next_initial_actions = actions[actions_to_execute:inpainting_end].copy()
         else:
             self.next_initial_actions = None
 
+        # SPEEDUP_EVAL: interpolate the compressed chunk and rescale base motion so
+        # reducing policy calls does not reduce the accumulated [vx, vy, wz] travel.
         execution_chunk = actions[:actions_to_execute].copy()
         if should_compress:
             execution_chunk = self._interpolate_actions(execution_chunk, self.config.execute_in_n_steps)
@@ -200,6 +208,8 @@ class B1KActionChunkPostprocessor:
     def update_current_stage(self, predicted_subtask_logits: np.ndarray) -> None:
         if self.task_id is None:
             return
+        # SPEEDUP_EVAL: use a short vote history instead of switching stage on one
+        # noisy logit prediction; this is part of the champion action protocol.
         logits = np.asarray(predicted_subtask_logits).squeeze()
         if logits.ndim != 1:
             raise ValueError(f"Expected 1-D subtask logits, got {logits.shape}")

@@ -55,7 +55,7 @@ setup(
         "pillow~=11.0.0",
         "websockets>=15.0.1",
         "omegaconf>=2.3.0",
-        "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@release/b1k",
+        "lerobot[dataset] @ file:///mnt/data/nas/B_zone_nas/jiaqi/b1k2026/src/lerobot-b1k",
     ],
     extras_require={
         "dev": [

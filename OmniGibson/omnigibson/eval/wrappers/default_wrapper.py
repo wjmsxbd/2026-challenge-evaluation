@@ -22,7 +22,7 @@ class DefaultWrapper(EnvironmentWrapper):
             if not hasattr(sensor, "image_height") or not hasattr(sensor, "image_width"):
                 continue
             set_sensor_modalities(sensor, {"rgb"})
-            # Rebuilding an initialized Replicator render product can invalidate
+            # SPEEDUP_EVAL: rebuilding an initialized Replicator render product can invalidate
             # annotator nodes from another VectorEnvironment slot. The vector
             # evaluator configures this resolution before sensor creation, so
             # avoid a destructive detach/recreate when it is already correct.

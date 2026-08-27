@@ -180,6 +180,8 @@ def resolve_cpu_config(
 
 def apply_cpu_config(config: CPUConfig) -> None:
     """Apply affinity and native-library thread limits to the current process."""
+    # SPEEDUP_EVAL: isolate each evaluator/server worker's CPU set and cap native
+    # thread pools to prevent multi-GPU runs from oversubscribing the host CPU.
     if config.num_threads is not None:
         thread_count = str(config.num_threads)
         for env_name in THREAD_ENV_VARS:
@@ -202,5 +204,7 @@ def configure_runtime_thread_pools(num_threads: int | None) -> None:
     import cv2
     import torch
 
+    # SPEEDUP_EVAL: OpenCV and Torch can otherwise create independent pools in
+    # every vector worker, causing simulator/policy scheduling jitter.
     cv2.setNumThreads(num_threads)
     torch.set_num_threads(num_threads)

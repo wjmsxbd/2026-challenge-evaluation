@@ -14,6 +14,8 @@ def _seed_environment(seed):
 
 class VectorEnvironment:
     def __init__(self, num_envs, config, seeds=None):
+        # SPEEDUP_EVAL: multiple task environments share one Isaac Sim process;
+        # this removes the per-environment simulator startup/context overhead.
         self.num_envs = num_envs
         if seeds is None:
             seeds = [None] * num_envs
@@ -48,6 +50,8 @@ class VectorEnvironment:
         stays unchanged so PhysX tensor/contact views retain stable scene
         indices when only a subset of vector slots remains active.
         """
+        # SPEEDUP_EVAL: apply all active-slot actions before one global simulator
+        # step, then read each slot independently. This is the core vector speedup.
         indices = list(range(self.num_envs)) if env_indices is None else list(env_indices)
         if len(actions) != len(indices):
             raise ValueError(f"Expected {len(indices)} actions for env_indices={indices}, got {len(actions)}")
@@ -103,6 +107,8 @@ class VectorEnvironment:
         selected scene's saved state after all restores so those topology-related steps cannot create slot-order drift,
         then issue the single physics step that a normal ``Scene.reset`` performs.
         """
+        # SPEEDUP_EVAL: restore every selected scene before the shared physics step;
+        # this prevents reset order from making slot 0 and slot 1 diverge.
         indices = self._resolve_env_indices(env_indices)
         for idx in indices:
             self.envs[idx].scene.reset(step_physics=False)
@@ -118,6 +124,8 @@ class VectorEnvironment:
         flushes across slots. It is intended for synchronized evaluation resets, when no unselected environment is
         concurrently rolling out.
         """
+        # SPEEDUP_EVAL: preserve the baseline reset semantics while batching the
+        # render flush and observation read across the selected vector slots.
         indices = self._resolve_env_indices(env_indices)
         unsupported = [
             idx

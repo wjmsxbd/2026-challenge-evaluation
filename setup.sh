@@ -479,7 +479,8 @@ if [ "$OMNIGIBSON" = true ]; then
             }
 
             install_isaac_packages() {
-                local temp_dir=$(mktemp -d)
+                local temp_dir="${ISAACSIM_WHEEL_DIR:-/mnt/data/nas/B_zone_nas/jiaqi/b1k2026/isaacsim_wheels}"
+                mkdir -p "$temp_dir"
                 local packages=(
                     "omniverse_kit-107.3.1.206797"
                     "isaacsim_kernel-5.1.0.0"
@@ -517,9 +518,8 @@ if [ "$OMNIGIBSON" = true ]; then
                     local filepath="$temp_dir/$filename"
 
                     echo "Downloading $pkg..."
-                    if ! curl -fLsS "$url" -o "$filepath"; then
+                    if ! curl -4 -fL --retry 20 --retry-delay 5 --retry-all-errors --connect-timeout 30 -C - "$url" -o "$filepath"; then
                         echo "ERROR: Failed to download $pkg"
-                        rm -rf "$temp_dir"
                         return 1
                     fi
 
@@ -535,7 +535,6 @@ if [ "$OMNIGIBSON" = true ]; then
 
                 echo "Installing Isaac Sim packages..."
                 run_python -m pip install "${wheel_files[@]}"
-                rm -rf "$temp_dir"
 
             }
 
@@ -578,8 +577,8 @@ fi
 
 # Install Eval
 if [ "$EVAL" = true ]; then
-    # get torch version via pip and install corresponding torch-cluster
-    INSTALLED_TORCH_VERSION=$(run_python -m pip show torch | grep Version | cut -d " " -f 2)
+    # get torch version including local CUDA suffix and install corresponding torch-cluster
+    INSTALLED_TORCH_VERSION=$(run_python -c "import torch; print(torch.__version__.split('+git')[0])")
     run_python -m pip install torch-cluster -f https://data.pyg.org/whl/torch-${INSTALLED_TORCH_VERSION}.html
 fi
 

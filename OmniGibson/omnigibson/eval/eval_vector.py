@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--instance-indices", type=int, nargs="+", default=list(range(10)))
     parser.add_argument("--mode", choices=("train", "public_test", "hidden_test"), default="public_test")
     parser.add_argument("--num-rollouts", type=int, default=1)
+    # SPEEDUP_EVAL: default to two simulator slots so one policy request can
+    # serve both active rollouts on a GPU.
     parser.add_argument("--num-envs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0, help="Fixed environment RNG seed (default: 0).")
     parser.add_argument(
@@ -46,7 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-video", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--video-fps", type=int, default=30)
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    # SPEEDUP_EVAL: task-relevant room loading is enabled by default to reduce
+    # scene initialization and runtime object/render overhead.
     parser.add_argument("--partial-scene-load", action=argparse.BooleanOptionalAction, default=True)
+    # SPEEDUP_EVAL: the viewer camera is not a policy input or submission video;
+    # disabling it avoids an extra render product in headless throughput runs.
     parser.add_argument("--render-viewer-camera", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--actions-to-execute", type=int, default=26)
@@ -122,6 +128,8 @@ def main() -> None:
         raise SystemExit(f"Unknown 2026 challenge task: {args.task_name}")
     gm.HEADLESS = args.headless
     gm.RENDER_VIEWER_CAMERA = args.render_viewer_camera
+    # SPEEDUP_EVAL: seed Python/NumPy/Torch/CUDA/Warp before constructing or
+    # resetting environments so paired slots are reproducible.
     seed = seed_everything(args.seed)
     logger.info("Seeded environment Python, NumPy, Torch, CUDA, and Warp RNGs with seed=%s", seed)
     instance_ids = resolve_instance_ids(args.task_name, args.instance_indices, mode=args.mode)

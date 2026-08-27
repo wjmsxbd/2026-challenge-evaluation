@@ -7,6 +7,9 @@ promotes it, and validates the exact final directory set before declaring a run
 complete.
 """
 
+# SPEEDUP_EVAL: keep artifact validation independent from Isaac Sim so a failed
+# simulator attempt can be rejected/retried without importing or relaunching it.
+
 from __future__ import annotations
 
 import argparse
@@ -240,6 +243,8 @@ def _parse_queue(queue_file: Path) -> list[dict[str, Any]]:
 
 
 def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    # SPEEDUP_EVAL: freeze the expected task/instance/video set before workers
+    # start; later validation compares every attempt against this immutable plan.
     if args.output.exists():
         _fail(f"refusing to overwrite immutable manifest: {args.output}")
     if args.mode != "public_test":
@@ -283,6 +288,8 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
+    # SPEEDUP_EVAL: hash the exact manifest bytes so workers cannot silently use
+    # a different task set or instance selection during a long distributed run.
     raw_manifest, encoded = _load_json_bytes(path)
     manifest = _require_dict(raw_manifest, f"manifest {path}")
     _validate_manifest_structure(manifest, manifest_path=path)
