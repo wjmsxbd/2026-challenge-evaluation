@@ -222,9 +222,8 @@ def _launch_app():
             if gm.ENABLE_VR:
                 kit_file_name = kit_file_name.replace(".kit", "_vr.kit")
 
-        # Copy the OmniGibson kit file and icon file to the Isaac Sim apps directory. This is necessary because the Isaac Sim app
-        # expects the extensions to be reachable in the parent directory of the kit file. We copy on every launch to
-        # ensure that the kit file is always up to date.
+        # Copy the OmniGibson kit file and icon file to the Isaac Sim apps directory if they are not already there. This is
+        # necessary because the Isaac Sim app expects the extensions to be reachable in the parent directory of the kit file.
         assert (
             "EXP_PATH" in os.environ
         ), "The EXP_PATH variable is not set. Are you in an Isaac Sim installed environment?"
@@ -235,8 +234,10 @@ def _launch_app():
         icon_file_target = Path(exp_path) / "OmniGibson_logo.png"
 
         try:
-            shutil.copyfile(kit_file, kit_file_target)
-            shutil.copyfile(icon_file, icon_file_target)
+            if not kit_file_target.exists():
+                shutil.copyfile(kit_file, kit_file_target)
+            if not icon_file_target.exists():
+                shutil.copyfile(icon_file, icon_file_target)
         except Exception as e:
             raise e from ValueError(f"Failed to copy {kit_file_name} or {icon_file.name} to Isaac Sim apps directory.")
 
