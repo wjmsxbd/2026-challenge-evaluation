@@ -61,6 +61,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-history-len", type=int, default=3)
     parser.add_argument("--stage-votes-to-promote", type=int, default=2)
     parser.add_argument("--apply-eval-tricks", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--action-chunk-maintenance",
+        dest="action_chunk_maintenance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Carry the retained tail of each action chunk into the next policy request (default: enabled).",
+    )
+    parser.add_argument(
+        "--compression",
+        dest="compression",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compress predicted action chunks via interpolation (default: enabled).",
+    )
     parser.add_argument("--action-horizon", type=int, default=30)
     parser.add_argument(
         "--pi05-proprioception-schema",
@@ -176,6 +190,8 @@ def main() -> None:
                 "history_len": args.stage_history_len,
                 "votes_to_promote": args.stage_votes_to_promote,
                 "apply_eval_tricks": args.apply_eval_tricks,
+                "enable_action_chunk_maintenance": args.action_chunk_maintenance,
+                "enable_compression": args.compression,
                 "action_horizon": args.action_horizon,
             },
         }

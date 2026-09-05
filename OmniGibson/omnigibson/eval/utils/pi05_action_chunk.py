@@ -50,6 +50,13 @@ class B1KActionChunkConfig:
     history_len: int = 3
     votes_to_promote: int = 2
     apply_eval_tricks: bool = True
+    # Carry the unexecuted tail of one prediction into the next request. This
+    # is the action-chunk "maintenance" / inpainting prefix used by the
+    # champion evaluator.
+    enable_action_chunk_maintenance: bool = True
+    # Compress a longer predicted chunk into fewer simulator actions by
+    # interpolation (when execute_in_n_steps < actions_to_execute).
+    enable_compression: bool = True
     action_horizon: int = 30
 
     def validate(self) -> None:
@@ -143,7 +150,10 @@ class B1KActionChunkPostprocessor:
 
         # SPEEDUP_EVAL: keep the champion's task/stage-specific action correction
         # in the evaluator, rather than coupling it to the persistent policy server.
-        should_compress = self.config.execute_in_n_steps < self.config.actions_to_execute
+        should_compress = (
+            self.config.enable_compression
+            and self.config.execute_in_n_steps < self.config.actions_to_execute
+        )
         if self.config.apply_eval_tricks:
             apply_correction_rules, check_gripper_variation = _load_correction_functions()
             actions_before = actions.copy()
@@ -188,7 +198,11 @@ class B1KActionChunkPostprocessor:
         inpainting_end = actions_to_execute + self.config.actions_to_keep
         # SPEEDUP_EVAL: carry the chunk tail into the next request so consecutive
         # batched inferences remain temporally continuous.
-        if self.config.actions_to_keep and len(actions) >= inpainting_end:
+        if (
+            self.config.enable_action_chunk_maintenance
+            and self.config.actions_to_keep
+            and len(actions) >= inpainting_end
+        ):
             self.next_initial_actions = actions[actions_to_execute:inpainting_end].copy()
         else:
             self.next_initial_actions = None

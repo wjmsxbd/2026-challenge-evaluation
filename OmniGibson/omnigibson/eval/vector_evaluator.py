@@ -247,6 +247,8 @@ class VectorChunkEvaluator:
             history_len=int(action_cfg.history_len),
             votes_to_promote=int(action_cfg.votes_to_promote),
             apply_eval_tricks=bool(action_cfg.apply_eval_tricks),
+            enable_action_chunk_maintenance=bool(action_cfg.get("enable_action_chunk_maintenance", True)),
+            enable_compression=bool(action_cfg.get("enable_compression", True)),
             action_horizon=int(action_cfg.action_horizon),
         )
         self.postprocessors = [
@@ -277,7 +279,8 @@ class VectorChunkEvaluator:
 
         logger.info(
             "Vector chunk evaluation: envs=%s request_batch_max=%s env_seeds=%s actions=%s->%s "
-            "base_velocity_frame=%s render/get_obs/metrics every action=true "
+            "base_velocity_frame=%s action_chunk_maintenance=%s compression=%s "
+            "render/get_obs/metrics every action=true "
             "video_every_action=%s viewer_camera=%s",
             self.num_envs,
             self.num_envs,
@@ -285,6 +288,8 @@ class VectorChunkEvaluator:
             self.postprocessor_config.actions_to_execute,
             self.postprocessor_config.execute_in_n_steps,
             str(cfg.base_velocity_frame),
+            self.postprocessor_config.enable_action_chunk_maintenance,
+            self.postprocessor_config.enable_compression,
             bool(cfg.write_video),
             bool(gm.RENDER_VIEWER_CAMERA),
         )
@@ -625,7 +630,10 @@ class VectorChunkEvaluator:
         request["episode_step"] = env_step
         processor = self.postprocessors[slot]
         request["current_stage"] = th.tensor([processor.current_stage], dtype=th.int64)
-        if processor.next_initial_actions is not None:
+        if (
+            self.postprocessor_config.enable_action_chunk_maintenance
+            and processor.next_initial_actions is not None
+        ):
             request["initial_actions"] = th.from_numpy(processor.next_initial_actions.copy()).to(th.float32)
         return request
 
