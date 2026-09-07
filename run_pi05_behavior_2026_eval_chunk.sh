@@ -78,7 +78,7 @@ esac
 EVAL_WRITE_VIDEO="${EVAL_WRITE_VIDEO:-${PROFILE_WRITE_VIDEO}}"
 EVAL_PARTIAL_SCENE_LOAD="${EVAL_PARTIAL_SCENE_LOAD:-true}"
 EVAL_FAIL_FAST="${EVAL_FAIL_FAST:-true}"
-EVAL_MAX_TASK_ATTEMPTS="${EVAL_MAX_TASK_ATTEMPTS:-2}"
+EVAL_MAX_TASK_ATTEMPTS="${EVAL_MAX_TASK_ATTEMPTS:-5}"
 
 if [[ "${EVAL_PROFILE}" == submission && "${EVAL_WRITE_VIDEO}" != true ]]; then
   echo "EVAL_PROFILE=submission requires EVAL_WRITE_VIDEO=true; use throughput for a no-video run." >&2
@@ -119,7 +119,7 @@ Core overrides:
   EVAL_SEED                 Fixed environment RNG seed, default 0.
   EVAL_MAX_STEPS            Optional absolute timeout override; empty uses the human-length multiplier.
   EVAL_MAX_STEPS_MULTIPLIER Multiplier applied to mean human-demo length, default 1.5.
-  EVAL_MAX_TASK_ATTEMPTS    Whole-task attempts before terminal failure, default 2.
+  EVAL_MAX_TASK_ATTEMPTS    Whole-task attempts before terminal failure, default 5.
   GPU_IDS / NUM_GPUS        GPU IDs and number of colocated env/server pairs.
   PI05_REPO                 100-task PI0.5 source checkout; must contain champion_2026 config.
   PI05_POLICY_DIR           Training or merged inference checkpoint directory.

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Accelerated PI0.5 evaluation for all 100 tasks of the 2026 BEHAVIOR Challenge.
+# Persistent Isaac evaluation, copied from the chunk-balance scheduler.
+# The original scheduler and evaluator remain unchanged.
 #
 # Default protocol:
 #   - 100 official tasks (2026 task IDs 0-99)
@@ -15,12 +16,12 @@ set -euo pipefail
 #
 # The default throughput profile disables MP4 encoding. For submission-complete
 # outputs (the 2026 challenge requires videos), use:
-#   EVAL_PROFILE=submission bash run_pi05_behavior_2026_eval_chunk_balance.sh
+#   EVAL_PROFILE=submission bash run_eval_2026_persistent.sh
 #
 # Single-GPU smoke test:
 #   GPU_IDS=0 NUM_GPUS=1 TASK_IDS=0 TASK_LIMIT=1 \
 #     EVAL_INSTANCE_INDICES='0 1' EVAL_MAX_STEPS=100 \
-#     bash run_pi05_behavior_2026_eval_chunk_balance.sh
+#     bash run_eval_2026_persistent.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -28,7 +29,7 @@ BEHAVIOR_ROOT="${BEHAVIOR_ROOT:-${SCRIPT_DIR}}"
 PI05_REPO="${PI05_REPO:-/mnt/data_nas/wangjm/unirobot/behavior-1k-solution}"
 PI05_SERVER_SCRIPT="${PI05_SERVER_SCRIPT:-${BEHAVIOR_ROOT}/serve_pi05_behavior_2026_vector.py}"
 PI05_POLICY_CONFIG="${PI05_POLICY_CONFIG:-pi_behavior_b1k_2026}"
-PI05_POLICY_DIR="${PI05_POLICY_DIR:-/mnt/data/ckpt/[b1k]/pi_behavior_b1k_2026/20260730_b1k_2026_full_fast_8gpu_bs2048/44000}"
+PI05_POLICY_DIR="${PI05_POLICY_DIR:-/mnt/data/ckpt/[b1k]/pi_behavior_b1k_2026/20260819_b1k_2026_full_dlc_4node_bs2048_downsample6_val005_fast30hz_no_ki_from_pi05/40000}"
 PI05_INFERENCE_CKPT_SUFFIX="${PI05_INFERENCE_CKPT_SUFFIX:-_inference}"
 PI05_AUTO_CONVERT_CKPT="${PI05_AUTO_CONVERT_CKPT:-true}"
 PI05_CONVERT_SCRIPT="${PI05_CONVERT_SCRIPT:-${PI05_REPO}/scripts/merge_sharded_params_for_inference.py}"
@@ -60,7 +61,7 @@ NUM_GPUS="${NUM_GPUS:-8}"
 GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 GPU_IDS="${GPU_IDS//,/ }"
 VECTOR_ENVS_PER_PROCESS="${VECTOR_ENVS_PER_PROCESS:-2}"
-# Number of public instances in one scheduled evaluator process. Keeping this
+# Number of public instances in one request to the evaluator. Keeping this
 # equal to VECTOR_ENVS_PER_PROCESS preserves synchronized batch-2 inference.
 INSTANCE_CHUNK_SIZE="${INSTANCE_CHUNK_SIZE:-${VECTOR_ENVS_PER_PROCESS}}"
 PORT_BASE="${PORT_BASE:-7100}"
@@ -93,6 +94,9 @@ EVAL_WRITE_VIDEO="${EVAL_WRITE_VIDEO:-${PROFILE_WRITE_VIDEO}}"
 EVAL_PARTIAL_SCENE_LOAD="${EVAL_PARTIAL_SCENE_LOAD:-true}"
 EVAL_FAIL_FAST="${EVAL_FAIL_FAST:-true}"
 EVAL_MAX_TASK_ATTEMPTS="${EVAL_MAX_TASK_ATTEMPTS:-5}"
+# Optional wall-clock limit per request, including first startup (0 disables it).
+EVAL_REQUEST_TIMEOUT="${EVAL_REQUEST_TIMEOUT:-0}"
+EVAL_WORKER_SHUTDOWN_TIMEOUT="${EVAL_WORKER_SHUTDOWN_TIMEOUT:-30}"
 
 if [[ "${EVAL_PROFILE}" == submission && "${EVAL_WRITE_VIDEO}" != true ]]; then
   echo "EVAL_PROFILE=submission requires EVAL_WRITE_VIDEO=true; use throughput for a no-video run." >&2
@@ -105,8 +109,8 @@ EVAL_CPU_NUM_THREADS="${EVAL_CPU_NUM_THREADS:-auto}"
 SERVER_CPU_NUM_THREADS="${SERVER_CPU_NUM_THREADS:-2}"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="${LOG_DIR:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_${RUN_TS}}"
-EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_outputs}"
+LOG_DIR="${LOG_DIR:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_${RUN_TS}}"
+EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_outputs}"
 RUN_OUTPUT_ROOT="${EVAL_LOG_ROOT}/${RUN_TS}"
 QUEUE_FILE="${LOG_DIR}/task_queue.tsv"
 QUEUE_DIR="${LOG_DIR}/task_queues"
@@ -127,7 +131,7 @@ DRY_RUN=false
 
 usage() {
   cat <<'EOF'
-Usage: bash run_pi05_behavior_2026_eval_chunk_balance.sh [--base-velocity-frame absolute|relative] [--dry-run] [--help]
+Usage: bash run_eval_2026_persistent.sh [--base-velocity-frame absolute|relative] [--dry-run] [--help]
 
 Core overrides:
   EVAL_PROFILE              throughput (no videos) or submission (videos), default throughput.
@@ -138,6 +142,8 @@ Core overrides:
   EVAL_MAX_STEPS            Optional absolute timeout override; empty uses the human-length multiplier.
   EVAL_MAX_STEPS_MULTIPLIER Multiplier applied to mean human-demo length, default 1.5.
   EVAL_MAX_TASK_ATTEMPTS    Whole-task attempts before terminal failure, default 5.
+  EVAL_REQUEST_TIMEOUT      Per-chunk wall-clock limit including startup, default 0 (disabled).
+  EVAL_WORKER_SHUTDOWN_TIMEOUT  Graceful Isaac shutdown limit in seconds, default 30.
   GPU_IDS / NUM_GPUS        GPU IDs and number of colocated env/server pairs.
   INSTANCE_CHUNK_SIZE       Instances per scheduled chunk, defaulting to the vector-env count (2).
   TASK_STATS_FILE           Per-task human statistics used for load balancing.
@@ -149,7 +155,7 @@ Core overrides:
   PI05_BASE_VELOCITY_FRAME  Policy observation base qvel frame: absolute (legacy raw) or relative (robot-local), default absolute. Actions are always robot-local.
   PI05_ENV_DIR              PI0.5 environment directory, default ${PI05_REPO}/.venv.
   BEHAVIOR_ENV_DIR          2026 evaluator conda environment directory.
-  DRIVER_FIX_SCRIPT         Script sourced before every evaluator attempt, default ~/driver_fix/activate.sh.
+  DRIVER_FIX_SCRIPT         Script sourced when starting an evaluator process, default ~/driver_fix/activate.sh.
   LOG_DIR / EVAL_LOG_ROOT   Scheduler logs and evaluator outputs.
 
 The scheduler builds one shared online chunk queue. Chunks are ordered by
@@ -160,6 +166,9 @@ The default checkpoint is the 100-task 2026 PI_BEHAVIOR checkpoint. If the
 requested training checkpoint is sharded, an existing sibling ending in
 _inference is selected or created automatically. One server is loaded once per
 GPU worker and reused until that worker's task queue is empty.
+Each worker also retains one Isaac process. Same-task chunks reuse environments;
+task changes clear and rebuild both scenes while preserving the Isaac app.
+Failed requests restart the evaluator before retrying; output checks are retained.
 EOF
 }
 
@@ -394,6 +403,10 @@ validate_environment() {
   validate_positive_int PI05_DYNAMIC_BATCH_GRANULARITY "${PI05_DYNAMIC_BATCH_GRANULARITY}"
   validate_positive_int TASK_LIMIT "${TASK_LIMIT}"
   validate_positive_int EVAL_MAX_TASK_ATTEMPTS "${EVAL_MAX_TASK_ATTEMPTS}"
+  [[ "${EVAL_REQUEST_TIMEOUT}" =~ ^(0|[1-9][0-9]*)$ ]] || {
+    echo "EVAL_REQUEST_TIMEOUT must be a non-negative integer." >&2; exit 2;
+  }
+  validate_positive_int EVAL_WORKER_SHUTDOWN_TIMEOUT "${EVAL_WORKER_SHUTDOWN_TIMEOUT}"
   validate_positive_float EVAL_MAX_STEPS_MULTIPLIER "${EVAL_MAX_STEPS_MULTIPLIER}"
   [[ -z "${EVAL_MAX_STEPS}" ]] || validate_positive_int EVAL_MAX_STEPS "${EVAL_MAX_STEPS}"
   validate_seed EVAL_SEED "${EVAL_SEED}"
@@ -428,7 +441,7 @@ validate_environment() {
     exit 1
   }
   [[ -f "${PI05_SERVER_SCRIPT}" ]] || { echo "PI0.5 vector server is missing: ${PI05_SERVER_SCRIPT}" >&2; exit 1; }
-  [[ -f "${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/eval_vector.py" ]] || {
+  [[ -f "${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/eval_persistent.py" ]] || {
     echo "2026 vector evaluator is missing under ${BEHAVIOR_ROOT}." >&2
     exit 1
   }
@@ -733,7 +746,8 @@ launch_eval() {
   local -a chunk_indices
   read -r -a chunk_indices <<<"${instance_indices//,/ }"
   local -a args=(
-    -m omnigibson.eval.eval_vector
+    -m omnigibson.eval.eval_persistent
+    --worker-dir "${PERSISTENT_WORKER_DIR}"
     --task-name "${task_name}"
     --host "${PI05_CLIENT_HOST}"
     --port "${port}"
@@ -838,11 +852,82 @@ log_has_fatal_error() {
     "${log_file}"
 }
 
+stop_eval_worker() {
+  local worker="$1" graceful="${2:-false}" deadline
+  if [[ -n "${PERSISTENT_EVAL_PID}" ]]; then
+    if [[ "${graceful}" == true ]]; then
+      : >"${PERSISTENT_WORKER_DIR}/shutdown"
+      deadline=$((SECONDS + EVAL_WORKER_SHUTDOWN_TIMEOUT))
+      while kill -0 "${PERSISTENT_EVAL_PID}" 2>/dev/null && (( SECONDS < deadline )); do sleep 1; done
+    fi
+    kill_process_group "${PERSISTENT_EVAL_PID}"
+    wait "${PERSISTENT_EVAL_PID}" 2>/dev/null || true
+    rm -f "${PID_DIR}/eval_worker${worker}.pid"
+    PERSISTENT_EVAL_PID=""
+  fi
+}
+
+run_persistent_chunk() {
+  local gpu_id="$1" worker="$2" port="$3" task_name="$4" attempt_dir="$5" log_file="$6" indices="$7" server_pid="$8" request_id="$9"
+  local start_line=1 started=${SECONDS} response_id response_status process_status
+  if [[ -n "${PERSISTENT_EVAL_PID}" ]] && ! kill -0 "${PERSISTENT_EVAL_PID}" 2>/dev/null; then
+    stop_eval_worker "${worker}"
+  fi
+  if [[ -z "${PERSISTENT_EVAL_PID}" ]]; then
+    PERSISTENT_GENERATION=$((PERSISTENT_GENERATION + 1))
+    PERSISTENT_WORKER_DIR="${LOG_DIR}/persistent/worker-${worker}/generation-${PERSISTENT_GENERATION}"
+    PERSISTENT_LOG="${PERSISTENT_WORKER_DIR}/evaluator.log"
+    mkdir -p "${PERSISTENT_WORKER_DIR}"
+    launch_eval "${gpu_id}" "${worker}" "${port}" "${task_name}" "${attempt_dir}" "${PERSISTENT_LOG}" "${indices}"
+    PERSISTENT_EVAL_PID="${LAUNCHED_PID}"
+    echo "${PERSISTENT_EVAL_PID}" >"${PID_DIR}/eval_worker${worker}.pid"
+  else
+    start_line=$(( $(wc -l <"${PERSISTENT_LOG}") + 1 ))
+  fi
+  rm -f "${PERSISTENT_WORKER_DIR}/response.tsv"
+  printf '%s\t%s\t%s\t%s\n' "${request_id}" "${task_name}" "${attempt_dir}" "${indices}" \
+    >"${PERSISTENT_WORKER_DIR}/request.tsv.tmp"
+  mv "${PERSISTENT_WORKER_DIR}/request.tsv.tmp" "${PERSISTENT_WORKER_DIR}/request.tsv"
+
+  PERSISTENT_STATUS=1
+  while true; do
+    if [[ -f "${PERSISTENT_WORKER_DIR}/response.tsv" ]]; then
+      IFS=$'\t' read -r response_id response_status <"${PERSISTENT_WORKER_DIR}/response.tsv"
+      if [[ "${response_id}" == "${request_id}" && "${response_status}" =~ ^[01]$ ]]; then
+        PERSISTENT_STATUS="${response_status}"
+      else
+        PERSISTENT_STATUS=126
+      fi
+      break
+    fi
+    if ! kill -0 "${PERSISTENT_EVAL_PID}" 2>/dev/null; then
+      if wait "${PERSISTENT_EVAL_PID}"; then process_status=1; else process_status=$?; fi
+      PERSISTENT_STATUS="${process_status}"
+      break
+    fi
+    if ! kill -0 "${server_pid}" 2>/dev/null || [[ -e "${STOP_FILE}" ]]; then
+      PERSISTENT_STATUS=125
+      break
+    fi
+    if (( EVAL_REQUEST_TIMEOUT > 0 && SECONDS - started >= EVAL_REQUEST_TIMEOUT )); then
+      PERSISTENT_STATUS=124
+      break
+    fi
+    sleep 1
+  done
+  if (( PERSISTENT_STATUS != 0 )); then stop_eval_worker "${worker}"; fi
+  # Keep a per-attempt log for the existing fatal-pattern and promotion checks.
+  tail -n +"${start_line}" "${PERSISTENT_LOG}" >"${log_file}"
+  printf '\nPersistent worker request=%s status=%s process_log=%s\n' \
+    "${request_id}" "${PERSISTENT_STATUS}" "${PERSISTENT_LOG}" >>"${log_file}"
+}
+
 worker_loop() {
   local worker="$1" gpu_id="$2" port="$3" server_pid="$4"
   local task_line task_id task_name chunk_indices timeout_steps chunk_steps queue_order output_dir attempt_parent attempt_dir log_file validation_log
   local assignment_position=0
-  local eval_pid eval_status validation_status fatal_detected promoted terminal_status attempt task_succeeded
+  local eval_status validation_status fatal_detected promoted terminal_status attempt task_succeeded
+  local PERSISTENT_EVAL_PID="" PERSISTENT_WORKER_DIR="" PERSISTENT_LOG="" PERSISTENT_GENERATION=0 PERSISTENT_STATUS=1
   while task_line="$(pop_next_task "${worker}")"; do
     IFS=$'\t' read -r task_id task_name chunk_indices timeout_steps chunk_steps queue_order <<<"${task_line}"
     assignment_position=$((assignment_position + 1))
@@ -869,14 +954,9 @@ worker_loop() {
         break
       fi
 
-      launch_eval "${gpu_id}" "${worker}" "${port}" "${task_name}" "${attempt_dir}" "${log_file}" "${chunk_indices}"
-      eval_pid="${LAUNCHED_PID}"
-      echo "${eval_pid}" >"${PID_DIR}/eval_worker${worker}.pid"
-      set +e
-      wait "${eval_pid}"
-      eval_status=$?
-      set -e
-      rm -f "${PID_DIR}/eval_worker${worker}.pid"
+      run_persistent_chunk "${gpu_id}" "${worker}" "${port}" "${task_name}" "${attempt_dir}" "${log_file}" \
+        "${chunk_indices}" "${server_pid}" "${assignment_position}-${attempt}"
+      eval_status="${PERSISTENT_STATUS}"
 
       if validate_chunk_artifacts "${task_name}" "${chunk_indices}" "${attempt_dir}" >"${validation_log}" 2>&1; then
         validation_status=0
@@ -917,6 +997,7 @@ worker_loop() {
         break
       fi
       echo "[worker ${worker}] task ${task_id}:${task_name} attempt ${attempt} failed; see ${log_file} and ${validation_log}" >&2
+      stop_eval_worker "${worker}"
       kill -0 "${server_pid}" >/dev/null 2>&1 || break
     done
 
@@ -925,11 +1006,15 @@ worker_loop() {
       echo "[worker ${worker}] task ${task_id}:${task_name} exhausted ${EVAL_MAX_TASK_ATTEMPTS} attempt(s)." >&2
       if [[ "${EVAL_FAIL_FAST}" == true ]]; then
         : >"${STOP_FILE}"
+        stop_eval_worker "${worker}"
         return 1
       fi
     fi
-    kill -0 "${server_pid}" >/dev/null 2>&1 || { echo "Server ${server_pid} exited." >&2; return 1; }
+    kill -0 "${server_pid}" >/dev/null 2>&1 || {
+      echo "Server ${server_pid} exited." >&2; stop_eval_worker "${worker}"; return 1;
+    }
   done
+  stop_eval_worker "${worker}" true
 }
 
 WORKER_PIDS=()
@@ -939,6 +1024,7 @@ CLEANUP_DONE=false
 cleanup() {
   [[ "${CLEANUP_DONE}" == true ]] && return 0
   CLEANUP_DONE=true
+  : >"${STOP_FILE}"
   local pid_file pid
   echo "Cleaning up evaluator and policy server processes..."
   while IFS= read -r pid_file; do
@@ -994,6 +1080,8 @@ echo "  CPU threads per server: ${SERVER_CPU_NUM_THREADS}"
 echo "  PI0.5 repo: ${PI05_REPO}"
 echo "  server entrypoint: ${PI05_SERVER_SCRIPT}"
 echo "  server lifecycle: one persistent PID per worker, reused across queued tasks"
+echo "  Isaac lifecycle: persistent PID; same-task env reuse, cross-task og.clear() + env rebuild"
+echo "  request timeout: ${EVAL_REQUEST_TIMEOUT}s (0 disables); worker shutdown timeout: ${EVAL_WORKER_SHUTDOWN_TIMEOUT}s"
 echo "  policy config: ${PI05_POLICY_CONFIG}"
 echo "  requested checkpoint: ${PI05_POLICY_DIR}"
 echo "  resolved checkpoint: ${PI05_RESOLVED_POLICY_DIR}"
@@ -1004,7 +1092,7 @@ echo "  proprioception schema: ${PI05_PROPRIOCEPTION_SCHEMA}"
 echo "  base velocity frame: ${PI05_BASE_VELOCITY_FRAME}"
 echo "  environment seed: ${EVAL_SEED}"
 echo "  behavior env: ${BEHAVIOR_ENV_DIR}"
-echo "  GPU driver activation: ${DRIVER_FIX_SCRIPT} (sourced before every evaluator attempt)"
+echo "  GPU driver activation: ${DRIVER_FIX_SCRIPT} (sourced on evaluator process startup)"
 echo "  PI0.5 env: ${PI05_ENV_DIR}"
 echo "  behavior Python: ${BEHAVIOR_PYTHON}"
 echo "  PI0.5 Python: ${PI05_PYTHON}"

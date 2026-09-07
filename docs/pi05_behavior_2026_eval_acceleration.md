@@ -245,7 +245,7 @@ bash run_pi05_behavior_2026_eval_chunk_balance.sh \
 | `EVAL_INSTANCE_INDICES` | `0 ... 9` | 每个 task 的 public instance index |
 | `EVAL_PROFILE` | `throughput` | `throughput` 或 `submission` |
 | `EVAL_FAIL_FAST` | `true` | 一个 task 失败后是否停止整个调度器 |
-| `EVAL_MAX_TASK_ATTEMPTS` | `2` | task 级最大尝试次数 |
+| `EVAL_MAX_TASK_ATTEMPTS` | `5` | task 级最大尝试次数 |
 | `NUM_GPUS` | `8` | 启动的 GPU worker 数量 |
 | `GPU_IDS` | `0 ... 7` | 使用的 GPU ID |
 | `PI05_BASE_VELOCITY_FRAME` | `absolute` | policy observation 的 base qvel frame |
