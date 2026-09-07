@@ -226,6 +226,7 @@ class VectorChunkEvaluator:
         self.num_envs = int(cfg.num_envs)
         self.task_id = int(cfg.task.id)
         self.task_name = str(cfg.task.name)
+        self.skip_action_chunk_rendering = bool(cfg.get("skip_action_chunk_rendering", False))
         # SPEEDUP_EVAL: keep both synchronized vector environments on the exact
         # same seed so slot assignment does not change the rollout RNG stream.
         # This intentionally mirrors the server's fixed JAX seed (0) and makes
@@ -280,7 +281,8 @@ class VectorChunkEvaluator:
         logger.info(
             "Vector chunk evaluation: envs=%s request_batch_max=%s env_seeds=%s actions=%s->%s "
             "base_velocity_frame=%s action_chunk_maintenance=%s compression=%s "
-            "render/get_obs/metrics every action=true "
+            "get_obs/metrics every action=true rendering=per-action-or-chunk-skip "
+            "skip_action_chunk_rendering=%s "
             "video_every_action=%s viewer_camera=%s",
             self.num_envs,
             self.num_envs,
@@ -290,6 +292,7 @@ class VectorChunkEvaluator:
             str(cfg.base_velocity_frame),
             self.postprocessor_config.enable_action_chunk_maintenance,
             self.postprocessor_config.enable_compression,
+            self.skip_action_chunk_rendering,
             bool(cfg.write_video),
             bool(gm.RENDER_VIEWER_CAMERA),
         )
@@ -735,8 +738,22 @@ class VectorChunkEvaluator:
                 # are always robot-local [vx, vy, wz]. base_velocity_frame only
                 # selects the base qvel representation exposed in observations.
                 actions.append(action)
-            observations, rewards, terminated, truncated, infos = self.vector_env.step(actions, env_indices=step_slots)
-            synced_obs = self._sync_lights(step_slots)
+            # The fast four-instance profile skips rendering only for action
+            # chunk steps 2..10 (1-based). Chunk boundaries and all other steps
+            # retain the normal rendered simulator path.
+            skip_chunk_rendering = getattr(self, "skip_action_chunk_rendering", False)
+            render_step = not (skip_chunk_rendering and 1 <= action_index <= 9)
+            if skip_chunk_rendering:
+                observations, rewards, terminated, truncated, infos = self.vector_env.step(
+                    actions, env_indices=step_slots, render=render_step
+                )
+            else:
+                # Keep the baseline call shape for custom/test vector environments that
+                # predate the optional render keyword.
+                observations, rewards, terminated, truncated, infos = self.vector_env.step(
+                    actions, env_indices=step_slots
+                )
+            synced_obs = self._sync_lights(step_slots) if render_step else None
             if synced_obs is not None:
                 observations = synced_obs
 

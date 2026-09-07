@@ -179,6 +179,11 @@ def main() -> None:
             "env_wrapper": {"_target_": args.env_wrapper},
             "output_dir": str(Path(args.output_dir).expanduser()),
             "write_video": args.write_video,
+            # Fast four-instance profile: optionally avoid rendering only for
+            # action-chunk steps 2 through 10 (1-based). The launcher controls
+            # this fixed behavior through one environment variable.
+            "skip_action_chunk_rendering": os.environ.get("PI05_SKIP_ACTION_CHUNK_RENDERING", "false").lower()
+            in {"1", "true", "yes", "on"},
             "video_fps": args.video_fps,
             "partial_scene_load": args.partial_scene_load,
             "proprioception_schema": args.pi05_proprioception_schema,

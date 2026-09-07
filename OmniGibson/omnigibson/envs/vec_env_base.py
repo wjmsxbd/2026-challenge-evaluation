@@ -42,7 +42,7 @@ class VectorEnvironment:
         seeds = getattr(self, "seeds", None)
         return None if seeds is None else seeds[index]
 
-    def step(self, actions, env_indices=None):
+    def step(self, actions, env_indices=None, render=True):
         """Step selected environments in one shared simulator tick.
 
         ``env_indices`` controls action application, observation reads, and
@@ -59,8 +59,9 @@ class VectorEnvironment:
         observations, rewards, terminates, truncates, infos = [], [], [], [], []
         for idx, action in zip(indices, actions):
             self.envs[idx]._pre_step(action)
-        # Evaluation requires one rendered 30 Hz frame after every action.
-        with og.sim.render_on_step(True):
+        # Normal evaluation renders one 30 Hz frame after every action. Fast
+        # profiles may disable this for selected action-chunk steps.
+        with og.sim.render_on_step(bool(render)):
             og.sim.step()
         for idx, action in zip(indices, actions):
             obs, reward, terminated, truncated, info = self.envs[idx]._post_step(action)

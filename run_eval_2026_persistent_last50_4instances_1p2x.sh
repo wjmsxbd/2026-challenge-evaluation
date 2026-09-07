@@ -12,4 +12,8 @@ export EVAL_MAX_STEPS_MULTIPLIER=1.2
 # An inherited absolute step limit would override the multiplier.
 unset EVAL_MAX_STEPS
 
+# Fixed fast-profile optimization: skip rendering only inside each action
+# chunk's steps 2..10 (1-based). Rendering resumes at step 1 and step 11.
+export PI05_SKIP_ACTION_CHUNK_RENDERING=true
+
 exec bash "${SCRIPT_DIR}/run_eval_2026_persistent.sh" "$@"
