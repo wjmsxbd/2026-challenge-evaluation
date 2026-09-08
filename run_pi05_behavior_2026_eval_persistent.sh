@@ -14,9 +14,9 @@ set -euo pipefail
 #     concurrently on different GPUs and are merged into the official task output
 #   - one policy request containing both environments per synchronized inference step
 #
-# The default throughput profile disables MP4 encoding. For submission-complete
-# outputs (the 2026 challenge requires videos), use:
-#   EVAL_PROFILE=submission bash run_eval_2026_persistent.sh
+# The default submission profile writes MP4 videos and validates them with the metrics.
+# For a metrics-only run without videos, use:
+#   EVAL_PROFILE=throughput bash run_eval_2026_persistent.sh
 #
 # Single-GPU smoke test:
 #   GPU_IDS=0 NUM_GPUS=1 TASK_IDS=0 TASK_LIMIT=1 \
@@ -26,19 +26,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BEHAVIOR_ROOT="${BEHAVIOR_ROOT:-${SCRIPT_DIR}}"
-PI05_REPO="${PI05_REPO:-/mnt/data_nas/wangjm/unirobot/behavior-1k-solution}"
-PI05_SERVER_SCRIPT="${PI05_SERVER_SCRIPT:-${BEHAVIOR_ROOT}/serve_pi05_behavior_2026_vector.py}"
+# Match the policy source and runtime used by pretrain/launch/pi_behavior/run_eval_2026.sh.
+CURRENT_PRETRAIN_ROOT="${CURRENT_PRETRAIN_ROOT:-${BEHAVIOR_ROOT}/../pretrain}"
+PI05_REPO="${PI05_REPO:-${CURRENT_PRETRAIN_ROOT}/jax_behavior}"
+PI05_SERVER_SCRIPT="${PI05_SERVER_SCRIPT:-${PI05_REPO}/scripts/serve_pi_behavior_2026_vector.py}"
 PI05_POLICY_CONFIG="${PI05_POLICY_CONFIG:-pi_behavior_b1k_2026}"
 PI05_POLICY_DIR="${PI05_POLICY_DIR:-/mnt/data/ckpt/[b1k]/pi_behavior_b1k_2026/20260819_b1k_2026_full_dlc_4node_bs2048_downsample6_val005_fast30hz_no_ki_from_pi05/59000}"
 PI05_INFERENCE_CKPT_SUFFIX="${PI05_INFERENCE_CKPT_SUFFIX:-_inference}"
 PI05_AUTO_CONVERT_CKPT="${PI05_AUTO_CONVERT_CKPT:-true}"
-PI05_CONVERT_SCRIPT="${PI05_CONVERT_SCRIPT:-${PI05_REPO}/scripts/merge_sharded_params_for_inference.py}"
-PI05_NORM_STATS_PATH="${PI05_NORM_STATS_PATH:-${PI05_REPO}/outputs/assets/pi_behavior_b1k_2026/behavior-1k/2026-challenge-demos/norm_stats.json}"
-PI05_TASK_CHECKPOINT_MAPPING="${PI05_TASK_CHECKPOINT_MAPPING:-${PI05_REPO}/task_checkpoint_mapping.json}"
+PI05_CONVERT_SCRIPT="${PI05_CONVERT_SCRIPT:-${CURRENT_PRETRAIN_ROOT}/../behavior-1k-solution/scripts/merge_sharded_params_for_inference.py}"
+PI05_ASSETS_ROOT="${PI05_ASSETS_ROOT:-${CURRENT_PRETRAIN_ROOT}/../behavior-1k-solution/outputs/assets/pi_behavior_b1k_2026}"
+PI05_NORM_STATS_PATH="${PI05_NORM_STATS_PATH:-${PI05_ASSETS_ROOT}/behavior-1k/2026-challenge-demos/norm_stats.json}"
+PI05_TASK_CHECKPOINT_MAPPING="${PI05_TASK_CHECKPOINT_MAPPING:-${CURRENT_PRETRAIN_ROOT}/task_checkpoint_mapping.json}"
 USE_PI05_TASK_CHECKPOINT_MAPPING="${USE_PI05_TASK_CHECKPOINT_MAPPING:-false}"
-# The PI0.5 policy server runs from the solution checkout's managed venv by
-# default. Override PI05_ENV_DIR / PI05_PYTHON when using another environment.
-PI05_ENV_DIR="${PI05_ENV_DIR:-${PI05_REPO}/.venv}"
+# Reuse the reference launcher's managed venv; policy source comes from PI05_REPO.
+PI05_ENV_DIR="${PI05_ENV_DIR:-${CURRENT_PRETRAIN_ROOT}/../behavior-1k-solution/.venv}"
 PI05_PYTHON="${PI05_PYTHON:-${PI05_ENV_DIR}/bin/python}"
 # Use the NAS-backed evaluator environment by default. Override
 # BEHAVIOR_ENV_DIR explicitly when running on another host.
@@ -84,7 +86,7 @@ PI05_DISABLE_FAST_AUXILIARY="${PI05_DISABLE_FAST_AUXILIARY:-true}"
 PI05_PROPRIOCEPTION_SCHEMA="${PI05_PROPRIOCEPTION_SCHEMA:-r1pro_v3_61}"
 PI05_BASE_VELOCITY_FRAME="${PI05_BASE_VELOCITY_FRAME:-absolute}"
 
-EVAL_PROFILE="${EVAL_PROFILE:-throughput}"
+EVAL_PROFILE="${EVAL_PROFILE:-submission}"
 case "${EVAL_PROFILE}" in
   throughput) PROFILE_WRITE_VIDEO=false ;;
   submission) PROFILE_WRITE_VIDEO=true ;;
@@ -134,7 +136,7 @@ usage() {
 Usage: bash run_eval_2026_persistent.sh [--base-velocity-frame absolute|relative] [--dry-run] [--help]
 
 Core overrides:
-  EVAL_PROFILE              throughput (no videos) or submission (videos), default throughput.
+  EVAL_PROFILE              submission (videos) or throughput (no videos), default submission.
   TASK_IDS                  Space/comma-separated 2026 task IDs in [0,99], default all 100.
   TASK_LIMIT                Limit queued tasks after selection, default 100.
   EVAL_INSTANCE_INDICES     Public split indices, default '0 1 2 3 4 5 6 7 8 9'.
@@ -147,13 +149,15 @@ Core overrides:
   GPU_IDS / NUM_GPUS        GPU IDs and number of colocated env/server pairs.
   INSTANCE_CHUNK_SIZE       Instances per scheduled chunk, defaulting to the vector-env count (2).
   TASK_STATS_FILE           Per-task human statistics used for load balancing.
-  PI05_REPO                 100-task PI0.5 source checkout; must contain champion_2026 config.
+  CURRENT_PRETRAIN_ROOT     Pretrain checkout, default the sibling pretrain directory.
+  PI05_REPO                 100-task PI0.5 source, default ${CURRENT_PRETRAIN_ROOT}/jax_behavior.
+  PI05_SERVER_SCRIPT        Policy server, default ${PI05_REPO}/scripts/serve_pi_behavior_2026_vector.py.
   PI05_POLICY_DIR           Training or merged inference checkpoint directory.
   PI05_AUTO_CONVERT_CKPT    Automatically merge sharded training checkpoints, default true.
   PI05_CONVERT_SCRIPT       Sharded-checkpoint merge script.
   PI05_NORM_STATS_PATH      2026 checkpoint normalization statistics.
   PI05_BASE_VELOCITY_FRAME  Policy observation base qvel frame: absolute (legacy raw) or relative (robot-local), default absolute. Actions are always robot-local.
-  PI05_ENV_DIR              PI0.5 environment directory, default ${PI05_REPO}/.venv.
+  PI05_ENV_DIR              Policy runtime, default the sibling behavior-1k-solution/.venv.
   BEHAVIOR_ENV_DIR          2026 evaluator conda environment directory.
   DRIVER_FIX_SCRIPT         Script sourced when starting an evaluator process, default ~/driver_fix/activate.sh.
   LOG_DIR / EVAL_LOG_ROOT   Scheduler logs and evaluator outputs.
@@ -317,7 +321,7 @@ for node in tree.body:
 if task_stages is None or len(task_stages) != 100:
     raise SystemExit(
         f"{model_path} exposes {len(task_stages) if task_stages is not None else 0} tasks; "
-        "PI05_REPO must point to the champion_2026 checkout"
+        "PI05_REPO must expose all 100 tasks for the 2026 checkpoint"
     )
 
 config_text = config_path.read_text(encoding="utf-8")
@@ -684,9 +688,9 @@ kill_process_group() {
   kill -KILL -- "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
 }
 
-SERVER_PYTHONPATH="${PI05_REPO}/src:${PI05_REPO}/openpi/src:${PYTHONPATH:-}"
-EVAL_PYTHONPATH="${BEHAVIOR_ROOT}/OmniGibson:${BEHAVIOR_ROOT}/bddl3:${BEHAVIOR_ROOT}/joylo:${BEHAVIOR_ROOT}:${PI05_REPO}/src:${PYTHONPATH:-}"
-export OMNIGIBSON_DATA_PATH
+SERVER_PYTHONPATH="${PI05_REPO}/src:${PI05_REPO}/openpi/src:${CURRENT_PRETRAIN_ROOT}:${PYTHONPATH:-}"
+EVAL_PYTHONPATH="${BEHAVIOR_ROOT}/OmniGibson:${BEHAVIOR_ROOT}/bddl3:${BEHAVIOR_ROOT}/joylo:${BEHAVIOR_ROOT}:${PI05_REPO}/src:${CURRENT_PRETRAIN_ROOT}:${PYTHONPATH:-}"
+export CURRENT_PRETRAIN_ROOT OMNIGIBSON_DATA_PATH
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}localhost,127.0.0.1,::1"
 export no_proxy="${no_proxy:+${no_proxy},}localhost,127.0.0.1,::1"
 
