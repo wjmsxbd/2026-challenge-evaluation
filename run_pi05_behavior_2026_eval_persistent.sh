@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Persistent Isaac evaluation, copied from the chunk-balance scheduler.
-# The original scheduler and evaluator remain unchanged.
+# Persistent Isaac evaluation with a rank-0 dynamic scheduler for PAI DLC.
+# Run this launcher once per node; each GPU keeps its policy and Isaac processes.
 #
 # Default protocol:
 #   - 100 official tasks (2026 task IDs 0-99)
@@ -59,7 +59,7 @@ EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-}"
 EVAL_MAX_STEPS_MULTIPLIER="${EVAL_MAX_STEPS_MULTIPLIER:-1.5}"
 EVAL_SEED="${EVAL_SEED:-0}"
 
-NUM_GPUS="${NUM_GPUS:-8}"
+NUM_GPUS="${NUM_GPUS:-${NPROC_PER_NODE:-8}}"
 GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
 GPU_IDS="${GPU_IDS//,/ }"
 VECTOR_ENVS_PER_PROCESS="${VECTOR_ENVS_PER_PROCESS:-2}"
@@ -71,6 +71,11 @@ PORT_STRIDE="${PORT_STRIDE:-100}"
 PI05_SERVER_HOST="${PI05_SERVER_HOST:-localhost}"
 PI05_CLIENT_HOST="${PI05_CLIENT_HOST:-localhost}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-900}"
+DLC_SCHEDULER_SCRIPT="${DLC_SCHEDULER_SCRIPT:-${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/utils/pi05_dynamic_scheduler.py}"
+DLC_SCHEDULER_BIND_HOST="${DLC_SCHEDULER_BIND_HOST:-0.0.0.0}"
+DLC_SCHEDULER_ADVERTISE_HOST="${DLC_SCHEDULER_ADVERTISE_HOST:-${MASTER_ADDR:-}}"
+DLC_SCHEDULER_PORT="${DLC_SCHEDULER_PORT:-6900}"
+DLC_SCHEDULER_REQUEST_TIMEOUT="${DLC_SCHEDULER_REQUEST_TIMEOUT:-60}"
 
 PI05_DYNAMIC_BATCH_MAX_SIZE="${PI05_DYNAMIC_BATCH_MAX_SIZE:-2}"
 PI05_DYNAMIC_BATCH_WAIT_MS="${PI05_DYNAMIC_BATCH_WAIT_MS:-0}"
@@ -110,30 +115,81 @@ EVAL_CPU_CORES="${EVAL_CPU_CORES:-auto}"
 EVAL_CPU_NUM_THREADS="${EVAL_CPU_NUM_THREADS:-auto}"
 SERVER_CPU_NUM_THREADS="${SERVER_CPU_NUM_THREADS:-2}"
 
-RUN_TS="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="${LOG_DIR:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_${RUN_TS}}"
+# PAI DLC starts this script once on every Worker node. WORLD_SIZE is the
+# number of nodes, RANK is this node's index, and NPROC_PER_NODE is the
+# number of local GPUs exposed to each Worker.
+DLC_WORLD_SIZE="${WORLD_SIZE:-1}"
+DLC_RANK="${RANK:-0}"
+DLC_NPROC_PER_NODE="${NPROC_PER_NODE:-${NUM_GPUS:-8}}"
+DLC_BARRIER_TIMEOUT="${DLC_BARRIER_TIMEOUT:-1800}"
+DLC_HEARTBEAT_INTERVAL="${DLC_HEARTBEAT_INTERVAL:-60}"
+DLC_HEARTBEAT_STALE_TIMEOUT="${DLC_HEARTBEAT_STALE_TIMEOUT:-1800}"
+DLC_RUN_KEY="${DLC_RUN_KEY:-${PAI_JOB_ID:-}}"
+
+[[ "${DLC_WORLD_SIZE}" =~ ^[1-9][0-9]*$ && "${DLC_RANK}" =~ ^(0|[1-9][0-9]*)$ \
+   && "${NUM_GPUS}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "WORLD_SIZE and NUM_GPUS must be positive integers; RANK must be non-negative." >&2
+  exit 2
+}
+DLC_MULTINODE=false
+(( DLC_WORLD_SIZE > 1 )) && DLC_MULTINODE=true
+
+if [[ -z "${DLC_RUN_KEY}" ]]; then
+  if [[ "${DLC_MULTINODE}" == true ]]; then
+    echo "DLC_RUN_KEY or PAI_JOB_ID is required for a multi-node run." >&2
+    exit 2
+  fi
+  DLC_RUN_KEY="$(date +%Y%m%d_%H%M%S)"
+fi
+
+RUN_TS="${DLC_RUN_KEY}"
+# LOG_DIR remains an alias for the shared log root. Rank subdirectories prevent
+# collisions when every DLC node receives the same launch command.
+GLOBAL_LOG_DIR="${GLOBAL_LOG_DIR:-${LOG_DIR:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_${RUN_TS}}}"
+LOG_DIR="${GLOBAL_LOG_DIR}/rank-${DLC_RANK}"
 EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_outputs}"
 RUN_OUTPUT_ROOT="${EVAL_LOG_ROOT}/${RUN_TS}"
-QUEUE_FILE="${LOG_DIR}/task_queue.tsv"
-QUEUE_DIR="${LOG_DIR}/task_queues"
+
+# Queue, summaries, stop signal and coordination markers are shared through
+# NAS. Process logs and PID files remain rank-local.
+QUEUE_FILE="${GLOBAL_LOG_DIR}/task_queue.tsv"
+QUEUE_DIR="${GLOBAL_LOG_DIR}/task_queues"
 ONLINE_QUEUE_FILE="${QUEUE_DIR}/online.tsv"
-CHUNK_RESULTS_FILE="${LOG_DIR}/chunk_results.tsv"
-SCHEDULE_FILE="${LOG_DIR}/task_schedule.tsv"
-ASSIGNMENTS_FILE="${LOG_DIR}/task_assignments.tsv"
-RESULTS_FILE="${LOG_DIR}/results.tsv"
-ATTEMPTS_FILE="${LOG_DIR}/attempts.tsv"
+WORKER_RECORD_DIR="${GLOBAL_LOG_DIR}/worker_records"
+CHUNK_RESULTS_FILE="${GLOBAL_LOG_DIR}/chunk_results.tsv"
+SCHEDULE_FILE="${GLOBAL_LOG_DIR}/task_schedule.tsv"
+ASSIGNMENTS_FILE="${GLOBAL_LOG_DIR}/task_assignments.tsv"
+RESULTS_FILE="${GLOBAL_LOG_DIR}/results.tsv"
+ATTEMPTS_FILE="${GLOBAL_LOG_DIR}/attempts.tsv"
 PID_DIR="${LOG_DIR}/pids"
-STOP_FILE="${LOG_DIR}/stop_requested"
+STOP_FILE="${GLOBAL_LOG_DIR}/stop_requested"
 ATTEMPTS_ROOT="${RUN_OUTPUT_ROOT}/.attempts"
 RUN_MANIFEST="${RUN_OUTPUT_ROOT}/run_manifest.json"
 RUN_COMPLETE="${RUN_OUTPUT_ROOT}/run_complete.json"
+
+COORD_DIR="${GLOBAL_LOG_DIR}/coord"
+RUN_CONFIG_FILE="${COORD_DIR}/run_config.json"
+CHECKPOINT_READY_FILE="${COORD_DIR}/checkpoint.path"
+QUEUE_READY_FILE="${COORD_DIR}/queue.ready"
+START_FILE="${COORD_DIR}/start.ready"
+RANK_READY_FILE="${COORD_DIR}/rank-${DLC_RANK}.ready"
+RANK_DONE_FILE="${COORD_DIR}/rank-${DLC_RANK}.done"
+RANK_STATUS_FILE="${COORD_DIR}/rank-${DLC_RANK}.status"
+RANK_HEARTBEAT_FILE="${COORD_DIR}/rank-${DLC_RANK}.heartbeat"
+FINAL_STATUS_FILE="${COORD_DIR}/final.status"
+SCHEDULER_ENDPOINT_FILE="${COORD_DIR}/scheduler.endpoint"
+SCHEDULER_JOURNAL_FILE="${COORD_DIR}/scheduler.journal.jsonl"
+TIMING_FILE="${GLOBAL_LOG_DIR}/timing.tsv"
+SCRIPT_START_EPOCH="$(date +%s)"
+
+TOTAL_SCHEDULER_SLOTS=$((DLC_WORLD_SIZE * NUM_GPUS))
 OUTPUT_VALIDATOR="${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/utils/pi05_output_validator.py"
 
 DRY_RUN=false
 
 usage() {
   cat <<'EOF'
-Usage: bash run_eval_2026_persistent.sh [--base-velocity-frame absolute|relative] [--dry-run] [--help]
+Usage: bash run_pi05_behavior_2026_eval_persistent.sh [--base-velocity-frame absolute|relative] [--dry-run] [--help]
 
 Core overrides:
   EVAL_PROFILE              submission (videos) or throughput (no videos), default submission.
@@ -143,7 +199,7 @@ Core overrides:
   EVAL_SEED                 Fixed environment RNG seed, default 0.
   EVAL_MAX_STEPS            Optional absolute timeout override; empty uses the human-length multiplier.
   EVAL_MAX_STEPS_MULTIPLIER Multiplier applied to mean human-demo length, default 1.5.
-  EVAL_MAX_TASK_ATTEMPTS    Whole-task attempts before terminal failure, default 5.
+  EVAL_MAX_TASK_ATTEMPTS    Attempts per instance chunk before terminal failure, default 5.
   EVAL_REQUEST_TIMEOUT      Per-chunk wall-clock limit including startup, default 0 (disabled).
   EVAL_WORKER_SHUTDOWN_TIMEOUT  Graceful Isaac shutdown limit in seconds, default 30.
   GPU_IDS / NUM_GPUS        GPU IDs and number of colocated env/server pairs.
@@ -160,11 +216,23 @@ Core overrides:
   PI05_ENV_DIR              Policy runtime, default the sibling behavior-1k-solution/.venv.
   BEHAVIOR_ENV_DIR          2026 evaluator conda environment directory.
   DRIVER_FIX_SCRIPT         Script sourced when starting an evaluator process, default ~/driver_fix/activate.sh.
-  LOG_DIR / EVAL_LOG_ROOT   Scheduler logs and evaluator outputs.
+  WORLD_SIZE / RANK         DLC node count / node rank (not torchrun process ranks), default 1 / 0.
+  NPROC_PER_NODE            Available GPUs per node; NUM_GPUS defaults to this value, or 8.
+  DLC_RUN_KEY               Shared unique run key; defaults to PAI_JOB_ID on DLC.
+  DLC_SCHEDULER_ADVERTISE_HOST  Rank-0 address reachable from every node, default MASTER_ADDR or rank-0 IP.
+  DLC_SCHEDULER_PORT        Preferred rank-0 HTTP scheduler port, default 6900.
+  DLC_SCHEDULER_REQUEST_TIMEOUT  Retry budget per HTTP operation in seconds, default 60.
+  DLC_BARRIER_TIMEOUT      Startup barrier timeout in seconds, default 1800.
+  DLC_HEARTBEAT_INTERVAL / DLC_HEARTBEAT_STALE_TIMEOUT  Rank heartbeat interval / stale limit, 60 / 1800 seconds.
+  GLOBAL_LOG_DIR / LOG_DIR  Shared NAS log root; process logs are placed in rank-<rank>/.
+  EVAL_LOG_ROOT             Shared NAS output root; all nodes must use the same paths.
 
-The scheduler builds one shared online chunk queue. Chunks are ordered by
-estimated task timeout steps (longest first); each worker claims the next
-available chunk only after finishing its current chunk.
+Rank 0 builds a longest-task-first queue and serves it over HTTP. Every GPU
+worker claims one instance chunk, completes it, then requests the next chunk.
+NAS holds outputs and coordination markers; the queue has a single writer on
+rank 0. Only rank 0 merges task outputs and issues the global run certificate.
+Use the same command on every DLC node; do not wrap this script in torchrun.
+A new run needs a fresh DLC_RUN_KEY (or a new PAI_JOB_ID).
 
 The default checkpoint is the 100-task 2026 PI_BEHAVIOR checkpoint. If the
 requested training checkpoint is sharded, an existing sibling ending in
@@ -401,6 +469,33 @@ validate_environment() {
   require_command taskset
   require_command setsid
   validate_positive_int NUM_GPUS "${NUM_GPUS}"
+  validate_positive_int DLC_WORLD_SIZE "${DLC_WORLD_SIZE}"
+  validate_positive_int DLC_NPROC_PER_NODE "${DLC_NPROC_PER_NODE}"
+  validate_positive_int DLC_BARRIER_TIMEOUT "${DLC_BARRIER_TIMEOUT}"
+  validate_positive_int DLC_HEARTBEAT_INTERVAL "${DLC_HEARTBEAT_INTERVAL}"
+  validate_positive_int DLC_HEARTBEAT_STALE_TIMEOUT "${DLC_HEARTBEAT_STALE_TIMEOUT}"
+  validate_positive_int DLC_SCHEDULER_PORT "${DLC_SCHEDULER_PORT}"
+  validate_positive_int DLC_SCHEDULER_REQUEST_TIMEOUT "${DLC_SCHEDULER_REQUEST_TIMEOUT}"
+  (( DLC_SCHEDULER_PORT <= 65535 )) || {
+    echo "DLC_SCHEDULER_PORT must be at most 65535, got: ${DLC_SCHEDULER_PORT}" >&2
+    exit 1
+  }
+  [[ "${DLC_RANK}" =~ ^[0-9]+$ ]] || {
+    echo "DLC_RANK must be a non-negative integer, got: ${DLC_RANK}" >&2
+    exit 1
+  }
+  (( DLC_RANK < DLC_WORLD_SIZE )) || {
+    echo "DLC_RANK=${DLC_RANK} must be smaller than DLC_WORLD_SIZE=${DLC_WORLD_SIZE}." >&2
+    exit 1
+  }
+  (( NUM_GPUS <= DLC_NPROC_PER_NODE )) || {
+    echo "NUM_GPUS=${NUM_GPUS} cannot exceed DLC_NPROC_PER_NODE=${DLC_NPROC_PER_NODE}." >&2
+    exit 1
+  }
+  [[ "${DLC_RUN_KEY}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    echo "DLC_RUN_KEY contains unsafe path characters: ${DLC_RUN_KEY}" >&2
+    exit 1
+  }
   validate_positive_int VECTOR_ENVS_PER_PROCESS "${VECTOR_ENVS_PER_PROCESS}"
   validate_positive_int INSTANCE_CHUNK_SIZE "${INSTANCE_CHUNK_SIZE}"
   validate_positive_int PI05_DYNAMIC_BATCH_MAX_SIZE "${PI05_DYNAMIC_BATCH_MAX_SIZE}"
@@ -481,7 +576,9 @@ validate_environment() {
       ;;
   esac
 
-  resolve_policy_checkpoint
+  [[ -f "${DLC_SCHEDULER_SCRIPT}" ]] || {
+    echo "Dynamic scheduler service is missing: ${DLC_SCHEDULER_SCRIPT}" >&2; exit 1;
+  }
   validate_pi05_2026_source
 
   read -r -a GPU_ID_LIST <<<"${GPU_IDS}"
@@ -526,7 +623,7 @@ build_task_queue() {
   TASK_IDS="${TASK_IDS//,/ }"
   mkdir -p "${QUEUE_DIR}"
   SELECTED_TASK_IDS="${TASK_IDS}" TASK_LIMIT_VALUE="${TASK_LIMIT}" \
-    NUM_SCHEDULER_SLOTS="${NUM_GPUS}" INSTANCE_COUNT_VALUE="${#INSTANCE_INDEX_LIST[@]}" \
+    NUM_SCHEDULER_SLOTS="${TOTAL_SCHEDULER_SLOTS}" INSTANCE_COUNT_VALUE="${#INSTANCE_INDEX_LIST[@]}" \
     INSTANCE_INDICES_VALUE="${INSTANCE_INDEX_LIST[*]}" \
     VECTOR_ENVS_VALUE="${VECTOR_ENVS_PER_PROCESS}" INSTANCE_CHUNK_SIZE_VALUE="${INSTANCE_CHUNK_SIZE}" \
     MAX_STEPS_OVERRIDE="${EVAL_MAX_STEPS}" \
@@ -601,7 +698,7 @@ for selection_order, task_id in enumerate(selected_ids):
         )
 
 # Online scheduling queue: longest estimated task-step chunks first.  Workers
-# claim from this one shared file at runtime, so faster GPUs naturally receive
+# claim from rank 0 over HTTP at runtime, so faster GPUs naturally receive
 # more work instead of being constrained by an offline per-GPU assignment.
 ordered_tasks = sorted(scheduled_tasks, key=lambda item: (-item["timeout_steps"], item["selection_order"]))
 
@@ -643,38 +740,294 @@ is_port_free() {
 find_free_port() {
   local port="$1"
   while ! is_port_free "${port}"; do port=$((port + 1)); done
+  (( port <= 65535 )) || { echo "No free port at or above $1." >&2; return 1; }
   echo "${port}"
 }
 
-pop_next_task() {
-  local worker="$1" line status
-  local worker_queue="${ONLINE_QUEUE_FILE}"
-  local worker_lock="${QUEUE_DIR}/online.lock"
-  set +e
-  line="$(
-    {
-      flock -x 9
-      [[ ! -e "${STOP_FILE}" && -s "${worker_queue}" ]] || exit 1
-      IFS= read -r next_line <"${worker_queue}"
-      tail -n +2 "${worker_queue}" >"${worker_queue}.tmp"
-      mv "${worker_queue}.tmp" "${worker_queue}"
-      echo "${next_line}"
-    } 9>"${worker_lock}"
-  )"
-  status=$?
-  set -e
-  (( status == 0 )) && [[ -n "${line}" ]] || return 1
-  echo "${line}"
+check_run_configuration() {
+  # GPU IDs and CPU affinity may differ between hosts; the evaluation protocol
+  # and number of workers per host must agree before any work is dispatched.
+  local -a config=(
+    "world_size=${DLC_WORLD_SIZE}" "num_gpus=${NUM_GPUS}"
+    "task_ids=${TASK_IDS//,/ }" "task_limit=${TASK_LIMIT}"
+    "instance_indices=${INSTANCE_INDEX_LIST[*]}" "chunk_size=${INSTANCE_CHUNK_SIZE}"
+    "num_envs=${VECTOR_ENVS_PER_PROCESS}" "max_steps=${EVAL_MAX_STEPS}"
+    "max_steps_multiplier=${EVAL_MAX_STEPS_MULTIPLIER}" "seed=${EVAL_SEED}"
+    "write_video=${EVAL_WRITE_VIDEO}" "partial_scene_load=${EVAL_PARTIAL_SCENE_LOAD}"
+    "policy_config=${PI05_POLICY_CONFIG}" "policy_dir=${PI05_POLICY_DIR}"
+    "policy_repo=${PI05_REPO}" "policy_server=${PI05_SERVER_SCRIPT}"
+    "norm_stats=${PI05_NORM_STATS_PATH}" "base_velocity_frame=${PI05_BASE_VELOCITY_FRAME}"
+    "apply_eval_tricks=${PI05_APPLY_EVAL_TRICKS}" "fail_fast=${EVAL_FAIL_FAST}"
+    "run_output_root=${RUN_OUTPUT_ROOT}" "dry_run=${DRY_RUN}"
+  )
+  python3 - "${RUN_CONFIG_FILE}" "${DLC_RANK}" "${config[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+config = dict(value.split("=", 1) for value in sys.argv[3:])
+if sys.argv[2] == "0":
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+else:
+    expected = json.loads(path.read_text(encoding="utf-8"))
+    differences = {key: (expected.get(key), value) for key, value in config.items() if expected.get(key) != value}
+    if differences:
+        raise SystemExit(f"Rank {sys.argv[2]} configuration differs from rank 0 (rank0, local): {differences}")
+PY
+}
+
+resolve_scheduler_advertise_host() {
+  local host="${DLC_SCHEDULER_ADVERTISE_HOST}"
+  if [[ -z "${host}" || ( "${DLC_MULTINODE}" == true && "${host}" =~ ^(localhost|127\.) ) ]]; then
+    host="$(hostname -I 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^127\./) {print $i; exit}}')"
+  fi
+  [[ -n "${host}" ]] || host="$(hostname -f)"
+  if [[ "${DLC_MULTINODE}" == true && "${host}" =~ ^(localhost|127\.) ]]; then
+    echo "Rank-0 scheduler address is not reachable from other nodes: ${host}" >&2
+    return 1
+  fi
+  printf '%s\n' "${host}"
+}
+
+start_dynamic_scheduler() {
+  local port advertise_host scheduler_log deadline
+  port="$(find_free_port "${DLC_SCHEDULER_PORT}")"
+  advertise_host="$(resolve_scheduler_advertise_host)" || return 1
+  scheduler_log="${LOG_DIR}/dynamic_scheduler_rank0_port${port}.log"
+  setsid python3 "${DLC_SCHEDULER_SCRIPT}" \
+    --host "${DLC_SCHEDULER_BIND_HOST}" \
+    --port "${port}" \
+    --queue-file "${ONLINE_QUEUE_FILE}" \
+    --stop-file "${STOP_FILE}" \
+    --journal "${SCHEDULER_JOURNAL_FILE}" \
+    --token "${DLC_RUN_KEY}" \
+    >"${scheduler_log}" 2>&1 &
+  SCHEDULER_PID="$!"
+
+  deadline=$((SECONDS + DLC_BARRIER_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    kill -0 "${SCHEDULER_PID}" >/dev/null 2>&1 || {
+      echo "Rank-0 dynamic scheduler exited; see ${scheduler_log}" >&2
+      return 1
+    }
+    if curl --noproxy '*' --max-time 2 -fsS "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+      SCHEDULER_URL="http://${advertise_host}:${port}"
+      write_shared_marker "${SCHEDULER_ENDPOINT_FILE}" "${SCHEDULER_URL}"
+      echo "Rank-0 dynamic scheduler: ${SCHEDULER_URL} (PID=${SCHEDULER_PID})"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Timed out starting rank-0 dynamic scheduler; see ${scheduler_log}" >&2
+  return 1
+}
+
+connect_dynamic_scheduler() {
+  local deadline=$((SECONDS + DLC_BARRIER_TIMEOUT))
+  wait_for_shared_file "${SCHEDULER_ENDPOINT_FILE}" "rank-0 dynamic scheduler endpoint"
+  SCHEDULER_URL="$(<"${SCHEDULER_ENDPOINT_FILE}")"
+  [[ "${SCHEDULER_URL}" =~ ^http://[^/]+:[0-9]+$ ]] || {
+    echo "Invalid dynamic scheduler endpoint: ${SCHEDULER_URL}" >&2
+    return 1
+  }
+  while (( SECONDS < deadline )); do
+    if curl --noproxy '*' --max-time 2 -fsS "${SCHEDULER_URL}/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Cannot reach rank-0 dynamic scheduler: ${SCHEDULER_URL}" >&2
+  return 1
+}
+
+write_shared_marker() {
+  local target="$1"
+  shift
+  local temporary="${target}.tmp.rank${DLC_RANK}.$$"
+  mkdir -p "$(dirname "${target}")"
+  printf '%s\n' "$*" >"${temporary}"
+  mv -T -- "${temporary}" "${target}"
+}
+
+wait_for_shared_file() {
+  local target="$1"
+  local description="$2"
+  local deadline=$((SECONDS + DLC_BARRIER_TIMEOUT))
+  local heartbeat_rank=""
+  local heartbeat_file=""
+  local heartbeat_epoch now age
+  local heartbeat_deadline=$((SECONDS + DLC_HEARTBEAT_STALE_TIMEOUT))
+
+  # Startup barriers retain a fixed timeout. Rank completion and final
+  # validation are governed by peer heartbeats instead.
+  if [[ "${target}" =~ /rank-([0-9]+)\.(done|status)$ ]]; then
+    heartbeat_rank="${BASH_REMATCH[1]}"
+  elif [[ "${target}" == "${FINAL_STATUS_FILE}" ]]; then
+    heartbeat_rank=0
+  fi
+
+  if [[ -n "${heartbeat_rank}" ]]; then
+    heartbeat_file="${COORD_DIR}/rank-${heartbeat_rank}.heartbeat"
+  fi
+
+  while [[ ! -e "${target}" ]]; do
+    if [[ -z "${heartbeat_rank}" && -e "${STOP_FILE}" ]]; then
+      echo "Run stopped while waiting for ${description}: ${target}" >&2
+      return 1
+    fi
+    if [[ -n "${heartbeat_rank}" ]]; then
+      heartbeat_epoch=""
+
+      if [[ -e "${heartbeat_file}" ]]; then
+        heartbeat_epoch="$(
+          sed -n 's/.*epoch=\([0-9][0-9]*\).*/\1/p' \
+            "${heartbeat_file}" 2>/dev/null || true
+        )"
+      fi
+
+      if [[ "${heartbeat_epoch}" =~ ^[0-9]+$ ]]; then
+        now="$(date +%s)"
+        age=$((now - heartbeat_epoch))
+        (( age >= 0 )) || age=0
+
+        if (( age > DLC_HEARTBEAT_STALE_TIMEOUT )); then
+          echo "Rank ${heartbeat_rank} heartbeat is stale (${age}s); " \
+               "while waiting for ${description}: ${target}" >&2
+          return 1
+        fi
+      elif (( SECONDS >= heartbeat_deadline )); then
+        echo "No valid heartbeat from rank ${heartbeat_rank} within " \
+             "${DLC_HEARTBEAT_STALE_TIMEOUT}s; " \
+             "while waiting for ${description}: ${target}" >&2
+        return 1
+      fi
+    elif (( SECONDS >= deadline )); then
+      echo "Timed out waiting for ${description}: ${target}" >&2
+      return 1
+    fi
+
+    sleep 2
+  done
+}
+
+HEARTBEAT_PID=""
+
+start_rank_heartbeat() {
+  [[ -z "${HEARTBEAT_PID}" ]] || {
+    echo "Rank heartbeat is already running: PID=${HEARTBEAT_PID}" >&2
+    return 1
+  }
+
+  local launcher_pid="${BASHPID}"
+  (
+    sleep_pid=""
+    trap 'kill "${sleep_pid}" 2>/dev/null || true; exit 0' INT TERM
+
+    while kill -0 "${launcher_pid}" 2>/dev/null; do
+      if ! write_shared_marker \
+          "${RANK_HEARTBEAT_FILE}" \
+          "rank=${DLC_RANK} epoch=$(date +%s) phase=alive"; then
+        echo "Failed to refresh rank ${DLC_RANK} heartbeat; retrying." >&2
+      fi
+
+      sleep "${DLC_HEARTBEAT_INTERVAL}" &
+      sleep_pid="$!"
+      wait "${sleep_pid}" || true
+    done
+  ) &
+
+  HEARTBEAT_PID="$!"
+}
+
+stop_rank_heartbeat() {
+  local pid="${HEARTBEAT_PID:-}"
+  [[ -n "${pid}" ]] || return 0
+
+  kill "${pid}" >/dev/null 2>&1 || true
+  wait "${pid}" >/dev/null 2>&1 || true
+  HEARTBEAT_PID=""
+}
+
+SCHEDULER_PID=""
+SCHEDULER_URL=""
+
+stop_dynamic_scheduler() {
+  local pid="${SCHEDULER_PID:-}"
+  [[ -n "${pid}" ]] || return 0
+  kill "${pid}" >/dev/null 2>&1 || true
+  wait "${pid}" >/dev/null 2>&1 || true
+  SCHEDULER_PID=""
+}
+
+scheduler_post() {
+  local endpoint="$1"
+  shift
+  local deadline=$((SECONDS + DLC_SCHEDULER_REQUEST_TIMEOUT))
+  local response
+  local -a curl_args=(
+    --noproxy '*'
+    --connect-timeout 5
+    --max-time 15
+    -fsS
+    -H "X-Scheduler-Token: ${DLC_RUN_KEY}"
+    -X POST
+  )
+  while (( $# > 0 )); do
+    curl_args+=(--data-urlencode "$1")
+    shift
+  done
+  while (( SECONDS < deadline )); do
+    if response="$(curl "${curl_args[@]}" "${SCHEDULER_URL}/${endpoint}")"; then
+      printf '%s\n' "${response}"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Scheduler request timed out: ${SCHEDULER_URL}/${endpoint}" >&2
+  return 1
+}
+
+claim_next_task() {
+  local worker="$1" response
+  response="$(scheduler_post claim "worker=${worker}")" || return 2
+  case "${response}" in
+    assigned$'\t'*) printf '%s\n' "${response#*$'\t'}" ;;
+    empty|stopped) return 1 ;;
+    *)
+      echo "Unexpected scheduler claim response for worker ${worker}: ${response}" >&2
+      return 2
+      ;;
+  esac
+}
+
+complete_task_claim() {
+  local worker="$1" queue_order="$2" completion_status="$3" response
+  response="$(scheduler_post complete \
+    "worker=${worker}" \
+    "queue_order=${queue_order}" \
+    "status=${completion_status}")" || return 1
+  case "${response}" in
+    complete|already_complete) return 0 ;;
+    *)
+      echo "Unexpected scheduler completion response for worker ${worker}: ${response}" >&2
+      return 1
+      ;;
+  esac
+}
+
+worker_record_path() {
+  local kind="$1" worker="$2"
+  printf '%s/worker-%s.%s.tsv\n' "${WORKER_RECORD_DIR}" "${worker}" "${kind}"
 }
 
 record_assignment() {
   local worker="$1" gpu="$2" task_id="$3" task_name="$4" chunk_indices="$5" timeout_steps="$6" chunk_steps="$7" order="$8" position="$9"
-  {
-    flock -x 9
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu}" "${position}" "${order}" \
-      "${task_id}" "${task_name}" "${chunk_indices}" "${timeout_steps}" >>"${ASSIGNMENTS_FILE}"
-  } 9>"${ASSIGNMENTS_FILE}.lock"
+  local target
+  target="$(worker_record_path assignments "${worker}")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu}" "${position}" "${order}" \
+    "${task_id}" "${task_name}" "${chunk_indices}" "${timeout_steps}" >>"${target}"
 }
 
 kill_process_group() {
@@ -698,6 +1051,7 @@ LAUNCHED_PID=""
 
 launch_server() {
   local gpu_id="$1" worker="$2" port="$3" log_file="$4"
+  local local_worker=$((worker % NUM_GPUS))
   local -a args=(
     "${PI05_SERVER_SCRIPT}"
     --host "${PI05_SERVER_HOST}"
@@ -730,7 +1084,7 @@ launch_server() {
       XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-platform}" \
       CUDA_VISIBLE_DEVICES="${gpu_id}" \
       PYTHONPATH="${SERVER_PYTHONPATH}" \
-      setsid taskset -c "${SERVER_CPU_LISTS[${worker}]}" "${PI05_PYTHON}" "${args[@]}"
+      setsid taskset -c "${SERVER_CPU_LISTS[${local_worker}]}" "${PI05_PYTHON}" "${args[@]}"
   ) >>"${log_file}" 2>&1 &
   LAUNCHED_PID="$!"
 }
@@ -747,6 +1101,7 @@ wait_for_server() {
 
 launch_eval() {
   local gpu_id="$1" worker="$2" port="$3" task_name="$4" output_dir="$5" log_file="$6" instance_indices="$7"
+  local local_worker=$((worker % NUM_GPUS))
   local -a chunk_indices
   read -r -a chunk_indices <<<"${instance_indices//,/ }"
   local -a args=(
@@ -761,7 +1116,7 @@ launch_eval() {
     --num-envs "${VECTOR_ENVS_PER_PROCESS}"
     --seed "${EVAL_SEED}"
     --output-dir "${output_dir}"
-    --cpu-affinity "${EVAL_CPU_LISTS[${worker}]}"
+    --cpu-affinity "${EVAL_CPU_LISTS[${local_worker}]}"
     --cpu-num-threads "${EVAL_CPU_NUM_THREADS}"
     --actions-to-execute "${PI05_ACTIONS_TO_EXECUTE}"
     --actions-to-keep "${PI05_ACTIONS_TO_KEEP}"
@@ -809,7 +1164,7 @@ launch_eval() {
       MPLCONFIGDIR="${LOG_DIR}/matplotlib-worker-${worker}" \
       CUDA_VISIBLE_DEVICES="${gpu_id}" \
       PYTHONPATH="${EVAL_PYTHONPATH}" \
-      setsid taskset -c "${EVAL_CPU_LISTS[${worker}]}" "${BEHAVIOR_PYTHON}" "${args[@]}"
+      setsid taskset -c "${EVAL_CPU_LISTS[${local_worker}]}" "${BEHAVIOR_PYTHON}" "${args[@]}"
   ) >"${log_file}" 2>&1 &
   LAUNCHED_PID="$!"
 }
@@ -828,25 +1183,27 @@ validate_chunk_artifacts() {
 
 record_result() {
   local state="$1" worker="$2" gpu="$3" task_id="$4" task_name="$5" status="$6" output_dir="$7"
-  {
-    flock -x 9
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "${state}" "${worker}" "${gpu}" \
-      "${task_id}" "${task_name}" "${status}" "${output_dir}" >>"${RESULTS_FILE}"
-  } 9>"${RESULTS_FILE}.lock"
+  local target
+  if [[ "${worker}" =~ ^[0-9]+$ ]]; then
+    target="$(worker_record_path results "${worker}")"
+  else
+    target="${RESULTS_FILE}"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${state}" "${worker}" "${gpu}" \
+    "${task_id}" "${task_name}" "${status}" "${output_dir}" >>"${target}"
 }
 
 record_attempt() {
   local worker="$1" gpu="$2" task_id="$3" task_name="$4" attempt="$5"
   local eval_status="$6" validation_status="$7" fatal_detected="$8" promoted="$9"
   local attempt_dir="${10}" final_dir="${11}" eval_log="${12}" validation_log="${13}"
-  {
-    flock -x 9
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu}" "${task_id}" "${task_name}" \
-      "${attempt}" "${eval_status}" "${validation_status}" "${fatal_detected}" "${promoted}" \
-      "${attempt_dir}" "${final_dir}" "${eval_log}|${validation_log}" >>"${ATTEMPTS_FILE}"
-  } 9>"${ATTEMPTS_FILE}.lock"
+  local target
+  target="$(worker_record_path attempts "${worker}")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu}" "${task_id}" "${task_name}" \
+    "${attempt}" "${eval_status}" "${validation_status}" "${fatal_detected}" "${promoted}" \
+    "${attempt_dir}" "${final_dir}" "${eval_log}|${validation_log}" >>"${target}"
 }
 
 log_has_fatal_error() {
@@ -932,7 +1289,20 @@ worker_loop() {
   local assignment_position=0
   local eval_status validation_status fatal_detected promoted terminal_status attempt task_succeeded
   local PERSISTENT_EVAL_PID="" PERSISTENT_WORKER_DIR="" PERSISTENT_LOG="" PERSISTENT_GENERATION=0 PERSISTENT_STATUS=1
-  while task_line="$(pop_next_task "${worker}")"; do
+  local claim_status completion_status worker_status=0
+  while true; do
+    if task_line="$(claim_next_task "${worker}")"; then
+      claim_status=0
+    else
+      claim_status=$?
+    fi
+    if (( claim_status == 1 )); then
+      break
+    elif (( claim_status != 0 )); then
+      : >"${STOP_FILE}"
+      stop_eval_worker "${worker}"
+      return 1
+    fi
     IFS=$'\t' read -r task_id task_name chunk_indices timeout_steps chunk_steps queue_order <<<"${task_line}"
     assignment_position=$((assignment_position + 1))
     record_assignment "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${chunk_indices}" \
@@ -992,12 +1362,9 @@ worker_loop() {
         "${attempt_dir}" "${output_dir}" "${log_file}" "${validation_log}"
 
       if [[ "${task_succeeded}" == true ]]; then
-        {
-          flock -x 9
-          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${chunk_indices}" \
-            >>"${CHUNK_RESULTS_FILE}"
-        } 9>"${CHUNK_RESULTS_FILE}.lock"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$(date '+%Y-%m-%d %H:%M:%S')" "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${chunk_indices}" \
+          >>"$(worker_record_path chunks "${worker}")"
         break
       fi
       echo "[worker ${worker}] task ${task_id}:${task_name} attempt ${attempt} failed; see ${log_file} and ${validation_log}" >&2
@@ -1005,7 +1372,19 @@ worker_loop() {
       kill -0 "${server_pid}" >/dev/null 2>&1 || break
     done
 
+    completion_status=failed
+    [[ "${task_succeeded}" == true ]] && completion_status=success
+    if [[ "${task_succeeded}" != true && "${EVAL_FAIL_FAST}" == true ]]; then
+      : >"${STOP_FILE}"
+    fi
+    if ! complete_task_claim "${worker}" "${queue_order}" "${completion_status}"; then
+      : >"${STOP_FILE}"
+      stop_eval_worker "${worker}"
+      return 1
+    fi
+
     if [[ "${task_succeeded}" != true ]]; then
+      worker_status=1
       record_result failed "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${terminal_status}" "${output_dir}"
       echo "[worker ${worker}] task ${task_id}:${task_name} exhausted ${EVAL_MAX_TASK_ATTEMPTS} attempt(s)." >&2
       if [[ "${EVAL_FAIL_FAST}" == true ]]; then
@@ -1019,6 +1398,7 @@ worker_loop() {
     }
   done
   stop_eval_worker "${worker}" true
+  return "${worker_status}"
 }
 
 WORKER_PIDS=()
@@ -1028,42 +1408,151 @@ CLEANUP_DONE=false
 cleanup() {
   [[ "${CLEANUP_DONE}" == true ]] && return 0
   CLEANUP_DONE=true
-  : >"${STOP_FILE}"
   local pid_file pid
   echo "Cleaning up evaluator and policy server processes..."
+  for pid in "${WORKER_PIDS[@]}"; do
+    kill "${pid}" 2>/dev/null || true
+  done
   while IFS= read -r pid_file; do
     [[ -f "${pid_file}" ]] || continue
     pid="$(<"${pid_file}")"
     kill_process_group "${pid}"
+    wait "${pid}" 2>/dev/null || true
   done < <(find "${PID_DIR}" -type f -name '*.pid' 2>/dev/null | sort)
+  for pid in "${WORKER_PIDS[@]}"; do
+    wait "${pid}" 2>/dev/null || true
+  done
+}
+
+launcher_exit() {
+  local status=$?
+  trap - INT TERM EXIT
+  # Normal local completion must never stop other ranks. Unexpected exits
+  # publish a failure and release peers that are still at a startup barrier.
+  if (( status != 0 )); then
+    : >"${STOP_FILE}"
+    write_shared_marker "${RANK_STATUS_FILE}" "${status}" || true
+    write_shared_marker "${RANK_DONE_FILE}" "rank=${DLC_RANK} status=${status}" || true
+    if (( DLC_RANK == 0 )) && [[ ! -e "${FINAL_STATUS_FILE}" ]]; then
+      write_shared_marker "${FINAL_STATUS_FILE}" 1 || true
+    fi
+  fi
+  cleanup
+  stop_dynamic_scheduler
+  stop_rank_heartbeat
+  exit "${status}"
 }
 
 validate_environment
 if [[ "${DRY_RUN}" != true ]]; then
   validate_gpu_runtime
 fi
-mkdir -p "${LOG_DIR}" "${PID_DIR}" "${RUN_OUTPUT_ROOT}" "${ATTEMPTS_ROOT}"
-build_task_queue
+
+mkdir -p "${GLOBAL_LOG_DIR}" "${LOG_DIR}" "${PID_DIR}" "${COORD_DIR}"
+
+# Rank 0 alone creates or truncates shared scheduler state. Other ranks wait
+# until the queue, summary tables and immutable manifest are complete.
+if (( DLC_RANK == 0 )); then
+  if [[ -e "${QUEUE_READY_FILE}" || -e "${START_FILE}" \
+        || -e "${FINAL_STATUS_FILE}" || -e "${ONLINE_QUEUE_FILE}" \
+        || -e "${SCHEDULER_ENDPOINT_FILE}" || -e "${SCHEDULER_JOURNAL_FILE}" \
+        || -e "${RUN_MANIFEST}" || -e "${RUN_CONFIG_FILE}" \
+        || -e "${STOP_FILE}" ]]; then
+    echo "Refusing to reuse non-empty multi-node run state: ${DLC_RUN_KEY}" >&2
+    exit 1
+  fi
+fi
+
+# Install failure propagation only after rank 0 has accepted a fresh run key.
+trap launcher_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if (( DLC_RANK == 0 )); then
+  check_run_configuration
+  # Rank 0 alone may convert a sharded checkpoint. Other nodes wait for the
+  # published path instead of competing for a checkpoint lock on NAS.
+  resolve_policy_checkpoint
+  write_shared_marker "${CHECKPOINT_READY_FILE}" "${PI05_RESOLVED_POLICY_DIR}"
+  mkdir -p "${RUN_OUTPUT_ROOT}" "${ATTEMPTS_ROOT}"
+  build_task_queue
+
+  TASK_COUNT="$(wc -l <"${QUEUE_FILE}" | tr -d ' ')"
+  (( TASK_COUNT > 0 )) || {
+    echo "No tasks queued." >&2
+    exit 1
+  }
+
+  printf 'timestamp\tstate\tworker\tgpu\ttask_id\ttask_name\tstatus\toutput_dir\n' \
+    >"${RESULTS_FILE}"
+  printf 'timestamp\tworker\tgpu\ttask_id\ttask_name\tattempt\tevaluator_status\tvalidation_status\tfatal_log\tpromoted\tattempt_dir\tfinal_dir\tlogs\n' \
+    >"${ATTEMPTS_FILE}"
+  printf 'timestamp\tworker\tgpu\ttask_id\ttask_name\tinstance_indices\n' \
+    >"${CHUNK_RESULTS_FILE}"
+  printf 'timestamp\tworker\tgpu\tworker_position\tqueue_order\ttask_id\ttask_name\tinstance_indices\ttimeout_steps\n' \
+    >"${ASSIGNMENTS_FILE}"
+
+  mkdir -p "${WORKER_RECORD_DIR}"
+  for ((worker_index = 0; worker_index < TOTAL_SCHEDULER_SLOTS; worker_index++)); do
+    : >"$(worker_record_path assignments "${worker_index}")"
+    : >"$(worker_record_path attempts "${worker_index}")"
+    : >"$(worker_record_path results "${worker_index}")"
+    : >"$(worker_record_path chunks "${worker_index}")"
+  done
+
+  manifest_video_arg=--no-write-video
+  [[ "${EVAL_WRITE_VIDEO}" == true ]] && manifest_video_arg=--write-video
+
+  python3 "${OUTPUT_VALIDATOR}" create-manifest \
+    --queue-file "${QUEUE_FILE}" \
+    --output "${RUN_MANIFEST}" \
+    --run-output-root "${RUN_OUTPUT_ROOT}" \
+    --mode public_test \
+    --instance-indices "${INSTANCE_INDEX_LIST[@]}" \
+    --num-rollouts 1 \
+    --num-vector-envs "${VECTOR_ENVS_PER_PROCESS}" \
+    "${manifest_video_arg}"
+
+  chmod 0444 "${RUN_MANIFEST}"
+
+  write_shared_marker "${QUEUE_READY_FILE}" \
+    "rank=0 tasks=${TASK_COUNT} instances=${#INSTANCE_INDEX_LIST[@]}"
+else
+  wait_for_shared_file \
+    "${QUEUE_READY_FILE}" \
+    "rank-0 queue initialization"
+  check_run_configuration
+fi
+
+PI05_RESOLVED_POLICY_DIR="$(<"${CHECKPOINT_READY_FILE}")"
+is_inference_checkpoint "${PI05_RESOLVED_POLICY_DIR}" || {
+  echo "Rank ${DLC_RANK} cannot read rank-0 checkpoint: ${PI05_RESOLVED_POLICY_DIR}" >&2
+  exit 1
+}
+
+for shared_file in \
+    "${QUEUE_FILE}" \
+    "${ONLINE_QUEUE_FILE}" \
+    "${SCHEDULE_FILE}" \
+    "${RESULTS_FILE}" \
+    "${ATTEMPTS_FILE}" \
+    "${CHUNK_RESULTS_FILE}" \
+    "${ASSIGNMENTS_FILE}" \
+    "${RUN_MANIFEST}"; do
+  [[ -e "${shared_file}" ]] || {
+    echo "Shared run file is missing after initialization: ${shared_file}" >&2
+    exit 1
+  }
+done
+
 TASK_COUNT="$(wc -l <"${QUEUE_FILE}" | tr -d ' ')"
-(( TASK_COUNT > 0 )) || { echo "No tasks queued." >&2; exit 1; }
+(( TASK_COUNT > 0 )) || {
+  echo "No tasks queued." >&2
+  exit 1
+}
+
 INSTANCE_COUNT="${#INSTANCE_INDEX_LIST[@]}"
 EXPECTED_RESULTS=$((TASK_COUNT * INSTANCE_COUNT))
-printf 'timestamp\tstate\tworker\tgpu\ttask_id\ttask_name\tstatus\toutput_dir\n' >"${RESULTS_FILE}"
-printf 'timestamp\tworker\tgpu\ttask_id\ttask_name\tattempt\tevaluator_status\tvalidation_status\tfatal_log\tpromoted\tattempt_dir\tfinal_dir\tlogs\n' >"${ATTEMPTS_FILE}"
-printf 'timestamp\tworker\tgpu\ttask_id\ttask_name\tinstance_indices\n' >"${CHUNK_RESULTS_FILE}"
-printf 'timestamp\tworker\tgpu\tworker_position\tqueue_order\ttask_id\ttask_name\tinstance_indices\ttimeout_steps\n' >"${ASSIGNMENTS_FILE}"
-manifest_video_arg=--no-write-video
-[[ "${EVAL_WRITE_VIDEO}" == true ]] && manifest_video_arg=--write-video
-python3 "${OUTPUT_VALIDATOR}" create-manifest \
-  --queue-file "${QUEUE_FILE}" \
-  --output "${RUN_MANIFEST}" \
-  --run-output-root "${RUN_OUTPUT_ROOT}" \
-  --mode public_test \
-  --instance-indices "${INSTANCE_INDEX_LIST[@]}" \
-  --num-rollouts 1 \
-  --num-vector-envs "${VECTOR_ENVS_PER_PROCESS}" \
-  "${manifest_video_arg}"
-chmod 0444 "${RUN_MANIFEST}"
 
 echo "PI0.5 accelerated BEHAVIOR 2026 official evaluation:"
 echo "  protocol: ${TASK_COUNT} tasks x ${INSTANCE_COUNT} public instances x 1 rollout = ${EXPECTED_RESULTS} outputs"
@@ -1072,9 +1561,11 @@ echo "  public instance indices: ${INSTANCE_INDEX_LIST[*]}"
 echo "  timeout: ${EVAL_MAX_STEPS:-official task-specific ${EVAL_MAX_STEPS_MULTIPLIER}x mean human length}"
 echo "  profile / write video: ${EVAL_PROFILE} / ${EVAL_WRITE_VIDEO}"
 echo "  official dynamics: physics=120 Hz, render/action=30 Hz"
-echo "  GPUs: ${GPU_ID_LIST[*]}"
+echo "  local GPUs: ${GPU_ID_LIST[*]}"
+echo "  DLC topology: ${DLC_WORLD_SIZE} nodes x ${NUM_GPUS} local GPUs = ${TOTAL_SCHEDULER_SLOTS} GPU workers"
+echo "  DLC rank: ${DLC_RANK}/${DLC_WORLD_SIZE}"
 echo "  topology: 1 persistent server + 1 Isaac Sim process x ${VECTOR_ENVS_PER_PROCESS} vector envs per GPU; joint batch-2 policy requests"
-echo "  scheduler: online longest-task-first by estimated timeout steps at instance-chunk granularity (${INSTANCE_CHUNK_SIZE} instances/chunk)"
+echo "  scheduler: rank-0 central HTTP longest-task-first queue (${INSTANCE_CHUNK_SIZE} instances/chunk)"
 awk -F '\t' 'NR > 1 {steps += $7; count++} END {
   printf "    pending chunks=%d estimated_steps=%d\n", count + 0, steps + 0
 }' "${SCHEDULE_FILE}"
@@ -1102,57 +1593,299 @@ echo "  behavior Python: ${BEHAVIOR_PYTHON}"
 echo "  PI0.5 Python: ${PI05_PYTHON}"
 echo "  outputs: ${RUN_OUTPUT_ROOT}"
 echo "  immutable manifest: ${RUN_MANIFEST}"
-echo "  whole-task attempts: ${EVAL_MAX_TASK_ATTEMPTS}"
+echo "  attempts per instance chunk: ${EVAL_MAX_TASK_ATTEMPTS}"
+echo "  scheduler preferred endpoint: ${DLC_SCHEDULER_ADVERTISE_HOST:-rank-0 auto IP}:${DLC_SCHEDULER_PORT}"
 echo "  logs: ${LOG_DIR}"
 
 if [[ "${DRY_RUN}" == true ]]; then
   echo
-  echo "Dry-run online longest-task-first schedule:"
+  echo "Dry-run central dynamic longest-task-first schedule:"
   cat "${SCHEDULE_FILE}"
   echo "Dry run complete; no server or simulator process was started."
   exit 0
 fi
 
-trap cleanup INT TERM EXIT
+if (( DLC_RANK == 0 )); then
+  start_dynamic_scheduler
+fi
+connect_dynamic_scheduler
 
 SERVER_PORTS=()
 SERVER_LOGS=()
-for ((worker = 0; worker < NUM_GPUS; worker++)); do
-  gpu_id="${GPU_ID_LIST[${worker}]}"
-  port="$(find_free_port "$((PORT_BASE + worker * PORT_STRIDE))")"
-  server_log="${LOG_DIR}/server_worker${worker}_gpu${gpu_id}_port${port}.log"
-  echo "[server ${worker}/gpu${gpu_id}] loading persistent checkpoint ${PI05_RESOLVED_POLICY_DIR} on port ${port}"
-  launch_server "${gpu_id}" "${worker}" "${port}" "${server_log}"
+
+for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
+  global_worker=$((DLC_RANK * NUM_GPUS + local_worker))
+  gpu_id="${GPU_ID_LIST[${local_worker}]}"
+  port="$(find_free_port "$((PORT_BASE + local_worker * PORT_STRIDE))")"
+  server_log="${LOG_DIR}/server_worker${global_worker}_gpu${gpu_id}_port${port}.log"
+
+  echo "[rank ${DLC_RANK}/server ${global_worker}/gpu${gpu_id}] loading persistent checkpoint ${PI05_RESOLVED_POLICY_DIR} on port ${port}"
+
+  launch_server \
+    "${gpu_id}" \
+    "${global_worker}" \
+    "${port}" \
+    "${server_log}"
+
   server_pid="${LAUNCHED_PID}"
   SERVER_PIDS+=("${server_pid}")
   SERVER_PORTS+=("${port}")
   SERVER_LOGS+=("${server_log}")
-  echo "${server_pid}" >"${PID_DIR}/server${worker}.pid"
+  echo "${server_pid}" >"${PID_DIR}/server${global_worker}.pid"
 done
 
-# All checkpoint loads run concurrently. Each PID remains alive and is reused
-# for every task subsequently claimed by the corresponding worker.
-for ((worker = 0; worker < NUM_GPUS; worker++)); do
-  wait_for_server "${SERVER_PIDS[${worker}]}" "${SERVER_PORTS[${worker}]}" || {
-    echo "Server ${worker} failed to become ready; see ${SERVER_LOGS[${worker}]}" >&2
-    exit 1
-  }
+# Every node loads its local servers concurrently. Evaluators start only
+# after all ranks have published healthy policy servers.
+for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
+  global_worker=$((DLC_RANK * NUM_GPUS + local_worker))
+
+  wait_for_server \
+    "${SERVER_PIDS[${local_worker}]}" \
+    "${SERVER_PORTS[${local_worker}]}" || {
+      echo "Server ${global_worker} failed to become ready; see ${SERVER_LOGS[${local_worker}]}" >&2
+      exit 1
+    }
 done
 
-for ((worker = 0; worker < NUM_GPUS; worker++)); do
-  worker_loop "${worker}" "${GPU_ID_LIST[${worker}]}" "${SERVER_PORTS[${worker}]}" "${SERVER_PIDS[${worker}]}" &
+write_shared_marker "${RANK_READY_FILE}" \
+  "rank=${DLC_RANK} servers=${NUM_GPUS} epoch=$(date +%s)"
+
+if (( DLC_RANK == 0 )); then
+  for ((rank_index = 0; rank_index < DLC_WORLD_SIZE; rank_index++)); do
+    wait_for_shared_file \
+      "${COORD_DIR}/rank-${rank_index}.ready" \
+      "rank ${rank_index} server readiness"
+  done
+
+  evaluation_start_epoch="$(date +%s)"
+  printf 'metric\tvalue\n' >"${TIMING_FILE}"
+  printf 'evaluation_start_epoch\t%s\n' \
+    "${evaluation_start_epoch}" >>"${TIMING_FILE}"
+
+  write_shared_marker "${START_FILE}" "${evaluation_start_epoch}"
+else
+  wait_for_shared_file \
+    "${START_FILE}" \
+    "rank-0 evaluation start barrier"
+fi
+
+EVALUATION_START_EPOCH="$(<"${START_FILE}")"
+[[ "${EVALUATION_START_EPOCH}" =~ ^[0-9]+$ ]] || {
+  echo "Invalid evaluation start marker: ${START_FILE}" >&2
+  exit 1
+}
+
+start_rank_heartbeat
+
+for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
+  global_worker=$((DLC_RANK * NUM_GPUS + local_worker))
+
+  worker_loop \
+    "${global_worker}" \
+    "${GPU_ID_LIST[${local_worker}]}" \
+    "${SERVER_PORTS[${local_worker}]}" \
+    "${SERVER_PIDS[${local_worker}]}" &
+
   WORKER_PIDS+=("$!")
 done
 
-overall_status=0
+local_status=0
 for worker_pid in "${WORKER_PIDS[@]}"; do
-  wait "${worker_pid}" || overall_status=1
+  wait "${worker_pid}" || local_status=1
 done
 
-# Reassemble chunk outputs into the official one-directory-per-task layout.
-# Each chunk was validated for its own instance subset above; the normal global
-# validator below then checks the merged task against the full manifest.
+# Stop only this rank's local evaluator/server processes before publishing its
+# completion marker.
+cleanup
+
+# Heartbeats and the rank-0 scheduler remain alive through global validation.
+
+local_server_log_error_count=0
+for server_log in "${SERVER_LOGS[@]}"; do
+  [[ -f "${server_log}" ]] || continue
+
+  if log_has_fatal_error "${server_log}"; then
+    echo "Fatal server log pattern found: ${server_log}" >&2
+    local_server_log_error_count=$((local_server_log_error_count + 1))
+  fi
+done
+(( local_server_log_error_count == 0 )) || local_status=1
+
+write_shared_marker "${RANK_STATUS_FILE}" "${local_status}"
+write_shared_marker "${RANK_DONE_FILE}" \
+  "rank=${DLC_RANK} status=${local_status} epoch=$(date +%s)"
+
+# Non-zero ranks never merge or validate the shared output. They remain alive
+# until rank 0 publishes the final global status.
+if (( DLC_RANK != 0 )); then
+  wait_for_shared_file \
+    "${FINAL_STATUS_FILE}" \
+    "rank-0 global validation"
+
+  final_status="$(<"${FINAL_STATUS_FILE}")"
+  [[ "${final_status}" =~ ^[0-9]+$ ]] || {
+    echo "Invalid final status marker: ${FINAL_STATUS_FILE}" >&2
+    exit 1
+  }
+
+  echo "Rank ${DLC_RANK} finished; global status=${final_status}."
+  exit "${final_status}"
+fi
+
+overall_status=0
+
+for ((rank_index = 0; rank_index < DLC_WORLD_SIZE; rank_index++)); do
+  if ! wait_for_shared_file \
+      "${COORD_DIR}/rank-${rank_index}.done" \
+      "rank ${rank_index} completion"; then
+    overall_status=1
+    continue
+  fi
+
+  rank_status_file="${COORD_DIR}/rank-${rank_index}.status"
+
+  if ! wait_for_shared_file \
+      "${rank_status_file}" \
+      "rank ${rank_index} status"; then
+    overall_status=1
+    continue
+  fi
+
+  rank_status="$(<"${rank_status_file}")"
+
+  if [[ ! "${rank_status}" =~ ^[0-9]+$ ]] \
+      || (( rank_status != 0 )); then
+    echo "Rank ${rank_index} reported status=${rank_status}." >&2
+    overall_status=1
+  fi
+done
+
+SCHEDULER_FINAL_STATS_FILE="${GLOBAL_LOG_DIR}/scheduler_final_stats.json"
+if ! curl --noproxy '*' --max-time 10 -fsS \
+    -H "X-Scheduler-Token: ${DLC_RUN_KEY}" \
+    "${SCHEDULER_URL}/stats" >"${SCHEDULER_FINAL_STATS_FILE}"; then
+  echo "Failed to read final dynamic scheduler state." >&2
+  overall_status=1
+elif ! python3 - "${SCHEDULER_FINAL_STATS_FILE}" "${SCHEDULE_FILE}" <<'PY'
+import csv
+import json
+import sys
+
+stats_path, schedule_path = sys.argv[1:]
+with open(stats_path, encoding="utf-8") as file:
+    stats = json.load(file)
+with open(schedule_path, newline="", encoding="utf-8") as file:
+    expected = sum(1 for _ in csv.DictReader(file, delimiter="\t"))
+print(f"dynamic_scheduler_stats={stats}")
+if stats["total"] != expected or stats["pending"] != 0 or stats["active"] != 0:
+    raise SystemExit("Dynamic scheduler did not reach a terminal state")
+if stats["completed"] != expected:
+    raise SystemExit("Dynamic scheduler completion count does not match the schedule")
+if stats["failed"] != 0 or stats["stopped"]:
+    raise SystemExit("Dynamic scheduler reported a failed or stopped run")
+PY
+then
+  overall_status=1
+fi
+stop_dynamic_scheduler
+
+# Each worker was the sole writer of its own record files. Rank 0 now
+# concatenates them into the public summary tables without any cross-node lock.
+for ((worker_index = 0; worker_index < TOTAL_SCHEDULER_SLOTS; worker_index++)); do
+  for record_kind in assignments attempts results chunks; do
+    source_file="$(worker_record_path "${record_kind}" "${worker_index}")"
+    if [[ ! -f "${source_file}" ]]; then
+      echo "Worker record file is missing: ${source_file}" >&2
+      overall_status=1
+      continue
+    fi
+    case "${record_kind}" in
+      assignments) cat "${source_file}" >>"${ASSIGNMENTS_FILE}" ;;
+      attempts) cat "${source_file}" >>"${ATTEMPTS_FILE}" ;;
+      results) cat "${source_file}" >>"${RESULTS_FILE}" ;;
+      chunks) cat "${source_file}" >>"${CHUNK_RESULTS_FILE}" ;;
+    esac
+  done
+done
+
+# Check the exact scheduled/assigned/successful chunk multisets. Counts alone
+# would not detect a duplicate replacing a missing chunk.
+set +e
+python3 - "${SCHEDULE_FILE}" "${ASSIGNMENTS_FILE}" "${CHUNK_RESULTS_FILE}" <<'PY'
+import csv
+import sys
+from collections import Counter
+
+schedule_path, assignments_path, chunks_path = sys.argv[1:]
+
+with open(schedule_path, newline="", encoding="utf-8") as file:
+    schedule_rows = list(csv.DictReader(file, delimiter="\t"))
+with open(assignments_path, newline="", encoding="utf-8") as file:
+    assignment_rows = list(csv.DictReader(file, delimiter="\t"))
+with open(chunks_path, newline="", encoding="utf-8") as file:
+    chunk_rows = list(csv.DictReader(file, delimiter="\t"))
+
+expected_assignments = Counter(
+    (
+        row["order"],
+        row["task_id"],
+        row["task_name"],
+        row["instance_indices"],
+        row["timeout_steps"],
+    )
+    for row in schedule_rows
+)
+actual_assignments = Counter(
+    (
+        row["queue_order"],
+        row["task_id"],
+        row["task_name"],
+        row["instance_indices"],
+        row["timeout_steps"],
+    )
+    for row in assignment_rows
+)
+expected_chunks = Counter(
+    (
+        row["task_id"],
+        row["task_name"],
+        row["instance_indices"],
+    )
+    for row in schedule_rows
+)
+actual_chunks = Counter(
+    (
+        row["task_id"],
+        row["task_name"],
+        row["instance_indices"],
+    )
+    for row in chunk_rows
+)
+
+print(f"scheduled_chunks={sum(expected_assignments.values())}")
+print(f"assigned_chunks={sum(actual_assignments.values())}")
+print(f"successful_chunks={sum(actual_chunks.values())}")
+
+if actual_assignments != expected_assignments:
+    print(f"missing_assignments={list((expected_assignments - actual_assignments).elements())[:20]}")
+    print(f"unexpected_assignments={list((actual_assignments - expected_assignments).elements())[:20]}")
+    raise SystemExit("Dynamic assignment records do not exactly match the schedule")
+if actual_chunks != expected_chunks:
+    print(f"missing_successful_chunks={list((expected_chunks - actual_chunks).elements())[:20]}")
+    print(f"unexpected_successful_chunks={list((actual_chunks - expected_chunks).elements())[:20]}")
+    raise SystemExit("Successful chunk records do not exactly match the schedule")
+
+print("DYNAMIC_SCHEDULE_RECORDS_OK=1")
+PY
+record_validation_status=$?
+set -e
+(( record_validation_status == 0 )) || overall_status=1
+
+# Rank 0 alone reassembles chunk outputs into the official one-directory-per-
+# task layout. The global validator then checks the merged task directories
+# against the immutable manifest.
 if (( overall_status == 0 )); then
+  set +e
   python3 - "${QUEUE_FILE}" "${RUN_OUTPUT_ROOT}" "${INSTANCE_INDEX_LIST[*]}" "${EVAL_WRITE_VIDEO}" <<'PY'
 import json
 import shutil
@@ -1204,18 +1937,30 @@ for line in Path(queue_file).read_text(encoding="utf-8").splitlines():
     }
     (final_dir / "evaluation_complete.json").write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
 PY
-  while IFS=$'\t' read -r task_id task_name; do
-    record_result ok "-" "-" "${task_id}" "${task_name}" 0 "${RUN_OUTPUT_ROOT}/task-${task_id}_${task_name}"
-  done <"${QUEUE_FILE}"
-fi
+  merge_status=$?
+  set -e
 
-trap - INT TERM EXIT
-cleanup
+  if (( merge_status == 0 )); then
+    while IFS=$'\t' read -r task_id task_name; do
+      record_result \
+        ok \
+        "-" \
+        "-" \
+        "${task_id}" \
+        "${task_name}" \
+        0 \
+        "${RUN_OUTPUT_ROOT}/task-${task_id}_${task_name}"
+    done <"${QUEUE_FILE}"
+  else
+    echo "Chunk-output merge failed with status=${merge_status}." >&2
+    overall_status=1
+  fi
+fi
 
 ok_count="$(awk -F '\t' 'NR > 1 && $2 == "ok" {n++} END {print n + 0}' "${RESULTS_FILE}")"
 failed_count="$(awk -F '\t' 'NR > 1 && $2 == "failed" {n++} END {print n + 0}' "${RESULTS_FILE}")"
 server_log_error_count=0
-for server_log in "${LOG_DIR}"/server_worker*.log; do
+for server_log in "${GLOBAL_LOG_DIR}"/rank-*/server_worker*.log; do
   [[ -f "${server_log}" ]] || continue
   if log_has_fatal_error "${server_log}"; then
     echo "Fatal server log pattern found: ${server_log}" >&2
@@ -1227,7 +1972,7 @@ done
 (( ok_count == TASK_COUNT )) || overall_status=1
 (( server_log_error_count == 0 )) || overall_status=1
 
-RUN_VALIDATION_LOG="${LOG_DIR}/run_validation.log"
+RUN_VALIDATION_LOG="${GLOBAL_LOG_DIR}/run_validation.log"
 global_validation_status=1
 if (( overall_status == 0 )); then
   if python3 "${OUTPUT_VALIDATOR}" validate-run \
@@ -1263,4 +2008,21 @@ if [[ "${EVAL_WRITE_VIDEO}" != true ]]; then
   echo "Note: throughput profile omitted MP4 files; rerun with EVAL_PROFILE=submission for submit-ready outputs."
 fi
 
+evaluation_end_epoch="$(date +%s)"
+evaluation_wall_seconds=$((evaluation_end_epoch - EVALUATION_START_EPOCH))
+scheduler_wall_seconds=$((evaluation_end_epoch - SCRIPT_START_EPOCH))
+
+printf 'evaluation_end_epoch\t%s\n' \
+  "${evaluation_end_epoch}" >>"${TIMING_FILE}"
+printf 'evaluation_wall_seconds\t%s\n' \
+  "${evaluation_wall_seconds}" >>"${TIMING_FILE}"
+printf 'scheduler_wall_seconds\t%s\n' \
+  "${scheduler_wall_seconds}" >>"${TIMING_FILE}"
+
+echo "Timing table: ${TIMING_FILE}"
+echo "Evaluation wall time: ${evaluation_wall_seconds} seconds"
+echo "Scheduler wall time: ${scheduler_wall_seconds} seconds"
+
+write_shared_marker "${FINAL_STATUS_FILE}" "${overall_status}"
+stop_rank_heartbeat
 exit "${overall_status}"
