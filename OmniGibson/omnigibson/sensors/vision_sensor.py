@@ -615,6 +615,11 @@ class VisionSensor(BaseSensor):
         for modality in tuple(self.modalities):
             self.remove_modality(modality)
 
+        # camera_parameters attaches an auxiliary annotator outside self.modalities.
+        # Release all auxiliary annotators before destroying the render product.
+        for modality in tuple(self._annotators or {}):
+            self._remove_modality_from_backend(modality)
+
         # Destroy the render product
         with og.sim.editing_usd():
             self._render_product.destroy()

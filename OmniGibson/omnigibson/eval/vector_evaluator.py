@@ -64,7 +64,6 @@ _PI05_PROPRIO_TARGET_SLICES = {
 _PI05_PROPRIO_DIM = 256
 _R1PRO_2026_PROPRIO_DIM = max(index.stop for index in PROPRIOCEPTION_INDICES["R1Pro"].values())
 _MAX_GRIPPER_WIDTH = 0.1
-_POLICY_IMAGE_SIZE = 224
 
 
 def _select_policy_base_qvel(
@@ -89,15 +88,6 @@ def _select_policy_base_qvel(
     converted = proprio.clone()
     converted[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]] = base_qvel
     return converted
-
-
-def _configure_policy_camera_resolution(robot_cfg: dict) -> None:
-    """Set policy camera resolution before VisionSensor render products exist."""
-    sensor_config = robot_cfg.setdefault("sensor_config", {})
-    vision_config = sensor_config.setdefault("VisionSensor", {})
-    sensor_kwargs = vision_config.setdefault("sensor_kwargs", {})
-    sensor_kwargs["image_height"] = _POLICY_IMAGE_SIZE
-    sensor_kwargs["image_width"] = _POLICY_IMAGE_SIZE
 
 
 def _adapt_proprio_for_pi05(proprio: th.Tensor) -> th.Tensor:
@@ -320,13 +310,11 @@ class VectorChunkEvaluator:
             raise ValueError("Robot config must use canonical 'model', not 'type'")
         robot_cfg["model"] = robot_cfg["model"].lower()
         self.robot_eval_config = _plain_dict(robot_cfg.pop("eval", None)) or {}
-        # SPEEDUP_EVAL: configure 224x224 before render products are created;
-        # changing an initialized camera would force a costly/destructive rebuild.
-        _configure_policy_camera_resolution(robot_cfg)
+        # Preserve capture resolution from the robot config. Downsampling belongs
+        # on the policy server, as it does for the raw demonstration images.
         logger.info(
-            "Policy camera resolution configured before sensor creation: %sx%s",
-            _POLICY_IMAGE_SIZE,
-            _POLICY_IMAGE_SIZE,
+            "Policy camera resolutions loaded from %s; resizing is handled by the policy server.",
+            robot_path,
         )
         robot_cfg["position"] = task_cfg["robot_start_position"]
         robot_cfg["orientation"] = task_cfg["robot_start_orientation"]

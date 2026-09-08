@@ -4,12 +4,11 @@ from omnigibson.utils.ui_utils import create_module_logger
 
 
 logger = create_module_logger(module_name=__name__)
-POLICY_IMAGE_SIZE = 224
 
 
 class DefaultWrapper(EnvironmentWrapper):
     """
-    Default eval wrapper: low-resolution RGB observations.
+    Default eval wrapper: RGB observations at the configured sensor resolution.
 
     Args:
         env (og.Environment): The environment to wrap.
@@ -22,14 +21,8 @@ class DefaultWrapper(EnvironmentWrapper):
             if not hasattr(sensor, "image_height") or not hasattr(sensor, "image_width"):
                 continue
             set_sensor_modalities(sensor, {"rgb"})
-            # SPEEDUP_EVAL: rebuilding an initialized Replicator render product can invalidate
-            # annotator nodes from another VectorEnvironment slot. The vector
-            # evaluator configures this resolution before sensor creation, so
-            # avoid a destructive detach/recreate when it is already correct.
-            if sensor.image_height != POLICY_IMAGE_SIZE:
-                sensor.image_height = POLICY_IMAGE_SIZE
-            if sensor.image_width != POLICY_IMAGE_SIZE:
-                sensor.image_width = POLICY_IMAGE_SIZE
+            # Preserve the capture resolution and its render product. The policy
+            # server resizes the images before passing them to the model.
             sensor_space = sensor.load_observation_space()
             if env.observation_space is not None:
                 env.observation_space.spaces[robot.name].spaces[sensor_name] = sensor_space

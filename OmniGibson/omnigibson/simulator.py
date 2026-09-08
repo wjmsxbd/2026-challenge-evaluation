@@ -1930,6 +1930,13 @@ def _launch_simulator(*args, **kwargs):
             # Stop the physics
             self.stop()
 
+            # Every camera is being discarded. Reset the shared SyntheticData
+            # graphs before any scene / render product is removed: per-annotator
+            # detach can otherwise recurse into cached, invalid OmniGraph nodes.
+            # reset() destroys the live graphs and clears their activation caches.
+            with self.editing_usd():
+                lazy.omni.syntheticdata.SyntheticData.Get().reset()
+
             # # Clean subscribed callbacks
             # self._pre_physics_step_callback.unsubscribe()
             # self._post_physics_step_callback.unsubscribe()

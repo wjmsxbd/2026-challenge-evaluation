@@ -105,3 +105,46 @@ def test_bbox_modalities(env, breakfast_table, dishtowel):
 
     assert bbox_2d_objs == bbox_2d_expected_objs
     assert bbox_3d_objs == bbox_3d_expected_objs
+
+
+def test_clear_after_reading_camera_parameters():
+    # Evaluation reads camera_parameters on every camera, attaching an auxiliary
+    # annotator which is deliberately absent from the observation modalities.
+    cfg = {
+        "scene": {"type": "Scene"},
+        "env": {
+            "external_sensors": [
+                {
+                    "sensor_type": "VisionSensor",
+                    "name": f"camera{index}",
+                    "modalities": ["rgb"],
+                    "sensor_kwargs": {"image_width": 64, "image_height": 64},
+                }
+                for index in range(3)
+            ]
+        },
+    }
+    app = None
+    for cycle in range(3):
+        vec_env = og.VectorEnvironment(2, cfg)
+        app = og.app if app is None else app
+        sensors = [sensor for env in vec_env.envs for sensor in env.external_sensors.values()]
+        for sensor in sensors:
+            assert "cameraViewTransform" in sensor.camera_parameters
+            assert "camera_params" not in sensor.modalities
+            assert sensor.get_obs()[0]["rgb"].shape == (64, 64, 4)
+
+        if cycle == 1:
+            # Reproduce a stale SyntheticData cache entry: the native node is
+            # gone but its annotator still holds the cached handle. Full clear
+            # must also recover from this state before building new cameras.
+            node = sensors[0]._annotators["rgb"].get_node()
+            with og.sim.editing_usd():
+                node.get_graph().destroy_node(node.get_prim_path(), True)
+            assert not node.is_valid()
+
+        vec_env.close()
+        del vec_env
+        og.clear()
+        assert og.app is app
+        assert all(annotator is None for sensor in sensors for annotator in sensor._annotators.values())
