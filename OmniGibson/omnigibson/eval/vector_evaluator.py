@@ -259,6 +259,19 @@ class VectorChunkEvaluator:
         self.robot_camera_names = get_robot_camera_names(self.robots[0].name, self.robot_eval_config)
         self._validate_robot_and_cameras()
         self._apply_robot_eval_settings()
+        self._policy_image_shapes_logged = set()
+        for slot, robot in enumerate(self.robots):
+            for role, camera_name in self.robot_camera_names.items():
+                sensor = robot.sensors[camera_name.split("::", 1)[1]]
+                logger.info(
+                    "Policy camera initialized: task=%s slot=%s camera=%s sensor=%s resolution=%sx%s (HxW)",
+                    self.task_name,
+                    slot,
+                    role,
+                    camera_name,
+                    sensor.image_height,
+                    sensor.image_width,
+                )
 
         self.policy = WebsocketPolicy(host=str(cfg.host), port=int(cfg.port))
         self._validate_server_metadata()
@@ -310,12 +323,8 @@ class VectorChunkEvaluator:
             raise ValueError("Robot config must use canonical 'model', not 'type'")
         robot_cfg["model"] = robot_cfg["model"].lower()
         self.robot_eval_config = _plain_dict(robot_cfg.pop("eval", None)) or {}
-        # Preserve capture resolution from the robot config. Downsampling belongs
-        # on the policy server, as it does for the raw demonstration images.
-        logger.info(
-            "Policy camera resolutions loaded from %s; resizing is handled by the policy server.",
-            robot_path,
-        )
+        # Use the configured capture resolution without rebuilding render products.
+        logger.info("Policy camera resolutions loaded from %s.", robot_path)
         robot_cfg["position"] = task_cfg["robot_start_position"]
         robot_cfg["orientation"] = task_cfg["robot_start_orientation"]
         config["robots"] = [robot_cfg]
@@ -640,7 +649,22 @@ class VectorChunkEvaluator:
             )
             for slot in active_slots
         ]
-        response = self.policy.infer(_snapshot_policy_value({"observation_batch": requests}))
+        payload = _snapshot_policy_value({"observation_batch": requests})
+        for slot, request in zip(active_slots, payload["observation_batch"]):
+            if slot in self._policy_image_shapes_logged:
+                continue
+            for key, value in request.items():
+                if key.endswith("::rgb"):
+                    logger.info(
+                        "Policy image before send: task=%s slot=%s key=%s shape=%s (HWC) dtype=%s",
+                        self.task_name,
+                        slot,
+                        key,
+                        tuple(value.shape),
+                        value.dtype,
+                    )
+            self._policy_image_shapes_logged.add(slot)
+        response = self.policy.infer(payload)
         action_chunks = np.asarray(response.get("action_chunk"))
         logits = np.asarray(response.get("subtask_logits"))
         batch_size = len(active_slots)

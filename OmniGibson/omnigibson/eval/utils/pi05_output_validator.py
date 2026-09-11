@@ -455,6 +455,19 @@ def _validate_video(path: Path, expected_frames: int, ffprobe: str) -> None:
         _fail(f"{path}: frame count {frame_count} does not equal result steps {expected_frames}")
 
 
+def validate_instance(
+    directory: Path, task_name: str, instance_id: int, *, write_video: bool, ffprobe: str = "ffprobe"
+) -> int:
+    """Validate one finished rollout, including one saved by an interrupted pair."""
+    name = f"{task_name}_{instance_id}_0"
+    steps = _validate_result_json(
+        directory / "json" / f"{name}.json", task_name=task_name, instance_id=instance_id, rollout_id=0
+    )
+    if write_video:
+        _validate_video(directory / "videos" / f"{name}.mp4", steps, ffprobe)
+    return steps
+
+
 def validate_task(
     manifest: dict[str, Any],
     task_id: int,

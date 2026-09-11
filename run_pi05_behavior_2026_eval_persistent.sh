@@ -142,54 +142,20 @@ if [[ -z "${DLC_RUN_KEY}" ]]; then
   DLC_RUN_KEY="$(date +%Y%m%d_%H%M%S)"
 fi
 
-RUN_TS="${DLC_RUN_KEY}"
-# LOG_DIR remains an alias for the shared log root. Rank subdirectories prevent
-# collisions when every DLC node receives the same launch command.
-GLOBAL_LOG_DIR="${GLOBAL_LOG_DIR:-${LOG_DIR:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_${RUN_TS}}}"
-LOG_DIR="${GLOBAL_LOG_DIR}/rank-${DLC_RANK}"
 EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-${BEHAVIOR_ROOT}/logs/pi05_behavior_2026_persistent_outputs}"
-RUN_OUTPUT_ROOT="${EVAL_LOG_ROOT}/${RUN_TS}"
-
-# Queue, summaries, stop signal and coordination markers are shared through
-# NAS. Process logs and PID files remain rank-local.
-QUEUE_FILE="${GLOBAL_LOG_DIR}/task_queue.tsv"
-QUEUE_DIR="${GLOBAL_LOG_DIR}/task_queues"
-ONLINE_QUEUE_FILE="${QUEUE_DIR}/online.tsv"
-WORKER_RECORD_DIR="${GLOBAL_LOG_DIR}/worker_records"
-CHUNK_RESULTS_FILE="${GLOBAL_LOG_DIR}/chunk_results.tsv"
-SCHEDULE_FILE="${GLOBAL_LOG_DIR}/task_schedule.tsv"
-ASSIGNMENTS_FILE="${GLOBAL_LOG_DIR}/task_assignments.tsv"
-RESULTS_FILE="${GLOBAL_LOG_DIR}/results.tsv"
-ATTEMPTS_FILE="${GLOBAL_LOG_DIR}/attempts.tsv"
-PID_DIR="${LOG_DIR}/pids"
-STOP_FILE="${GLOBAL_LOG_DIR}/stop_requested"
-ATTEMPTS_ROOT="${RUN_OUTPUT_ROOT}/.attempts"
-RUN_MANIFEST="${RUN_OUTPUT_ROOT}/run_manifest.json"
-RUN_COMPLETE="${RUN_OUTPUT_ROOT}/run_complete.json"
-
-COORD_DIR="${GLOBAL_LOG_DIR}/coord"
-RUN_CONFIG_FILE="${COORD_DIR}/run_config.json"
-CHECKPOINT_READY_FILE="${COORD_DIR}/checkpoint.path"
-QUEUE_READY_FILE="${COORD_DIR}/queue.ready"
-START_FILE="${COORD_DIR}/start.ready"
-RANK_READY_FILE="${COORD_DIR}/rank-${DLC_RANK}.ready"
-RANK_DONE_FILE="${COORD_DIR}/rank-${DLC_RANK}.done"
-RANK_STATUS_FILE="${COORD_DIR}/rank-${DLC_RANK}.status"
-RANK_HEARTBEAT_FILE="${COORD_DIR}/rank-${DLC_RANK}.heartbeat"
-FINAL_STATUS_FILE="${COORD_DIR}/final.status"
-SCHEDULER_ENDPOINT_FILE="${COORD_DIR}/scheduler.endpoint"
-SCHEDULER_JOURNAL_FILE="${COORD_DIR}/scheduler.journal.jsonl"
-TIMING_FILE="${GLOBAL_LOG_DIR}/timing.tsv"
+EVAL_LOG_PARENT="${EVAL_LOG_PARENT:-${BEHAVIOR_ROOT}/logs}"
+RESUME_LOG_DIR="${GLOBAL_LOG_DIR:-${LOG_DIR:-}}"
 SCRIPT_START_EPOCH="$(date +%s)"
 
 TOTAL_SCHEDULER_SLOTS=$((DLC_WORLD_SIZE * NUM_GPUS))
 OUTPUT_VALIDATOR="${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/utils/pi05_output_validator.py"
+RESUME_HELPER="${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/utils/pi05_persistent_resume.py"
 
 DRY_RUN=false
 
 usage() {
   cat <<'EOF'
-Usage: bash run_pi05_behavior_2026_eval_persistent.sh [--base-velocity-frame absolute|relative] [--dry-run] [--help]
+Usage: bash run_pi05_behavior_2026_eval_persistent.sh [--log-dir EXISTING_LOG_DIR] [--base-velocity-frame absolute|relative] [--dry-run] [--help]
 
 Core overrides:
   EVAL_PROFILE              submission (videos) or throughput (no videos), default submission.
@@ -218,13 +184,14 @@ Core overrides:
   DRIVER_FIX_SCRIPT         Script sourced when starting an evaluator process, default ~/driver_fix/activate.sh.
   WORLD_SIZE / RANK         DLC node count / node rank (not torchrun process ranks), default 1 / 0.
   NPROC_PER_NODE            Available GPUs per node; NUM_GPUS defaults to this value, or 8.
-  DLC_RUN_KEY               Shared unique run key; defaults to PAI_JOB_ID on DLC.
+  DLC_RUN_KEY               Optional coordination key, default PAI_JOB_ID; directory names are always dates.
   DLC_SCHEDULER_ADVERTISE_HOST  Rank-0 address reachable from every node, default MASTER_ADDR or rank-0 IP.
   DLC_SCHEDULER_PORT        Preferred rank-0 HTTP scheduler port, default 6900.
   DLC_SCHEDULER_REQUEST_TIMEOUT  Retry budget per HTTP operation in seconds, default 60.
   DLC_BARRIER_TIMEOUT      Startup barrier timeout in seconds, default 1800.
   DLC_HEARTBEAT_INTERVAL / DLC_HEARTBEAT_STALE_TIMEOUT  Rank heartbeat interval / stale limit, 60 / 1800 seconds.
-  GLOBAL_LOG_DIR / LOG_DIR  Shared NAS log root; process logs are placed in rank-<rank>/.
+  GLOBAL_LOG_DIR / LOG_DIR  Existing evaluation log directory to resume (also --log-dir); omitted starts from scratch.
+  EVAL_LOG_PARENT           Parent for fresh date-named log directories, default ${BEHAVIOR_ROOT}/logs.
   EVAL_LOG_ROOT             Shared NAS output root; all nodes must use the same paths.
 
 Rank 0 builds a longest-task-first queue and serves it over HTTP. Every GPU
@@ -232,7 +199,12 @@ worker claims one instance chunk, completes it, then requests the next chunk.
 NAS holds outputs and coordination markers; the queue has a single writer on
 rank 0. Only rank 0 merges task outputs and issues the global run certificate.
 Use the same command on every DLC node; do not wrap this script in torchrun.
-A new run needs a fresh DLC_RUN_KEY (or a new PAI_JOB_ID).
+Without a log directory, rank 0 creates a new YYYYMMDD_HHMMSS run and starts
+from scratch. Specify --log-dir (or LOG_DIR) to resume only that evaluation.
+Finished instances are validated and skipped; incomplete instances restart from
+their initial state. Outputs stay in the original run, while each resume's logs
+are kept under the specified log directory's .sessions/<date>/ subdirectory.
+No simulator state or action chunk is restored. Dry runs only plan on rank 0.
 
 The default checkpoint is the 100-task 2026 PI_BEHAVIOR checkpoint. If the
 requested training checkpoint is sharded, an existing sibling ending in
@@ -246,6 +218,16 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --log-dir)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--log-dir requires an existing log directory" >&2; exit 2; }
+      RESUME_LOG_DIR="$2"
+      shift 2
+      ;;
+    --log-dir=*)
+      RESUME_LOG_DIR="${1#*=}"
+      [[ -n "${RESUME_LOG_DIR}" ]] || { echo "--log-dir requires an existing log directory" >&2; exit 2; }
+      shift
+      ;;
     --base-velocity-frame)
       [[ $# -ge 2 ]] || { echo "--base-velocity-frame requires absolute or relative" >&2; exit 2; }
       PI05_BASE_VELOCITY_FRAME="$2"
@@ -492,7 +474,7 @@ validate_environment() {
     echo "NUM_GPUS=${NUM_GPUS} cannot exceed DLC_NPROC_PER_NODE=${DLC_NPROC_PER_NODE}." >&2
     exit 1
   }
-  [[ "${DLC_RUN_KEY}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  [[ "${DLC_RUN_KEY}" =~ ^[A-Za-z0-9._-]+$ && "${DLC_RUN_KEY}" != . && "${DLC_RUN_KEY}" != .. ]] || {
     echo "DLC_RUN_KEY contains unsafe path characters: ${DLC_RUN_KEY}" >&2
     exit 1
   }
@@ -548,6 +530,7 @@ validate_environment() {
     echo "PI0.5 output validator is missing: ${OUTPUT_VALIDATOR}" >&2
     exit 1
   }
+  [[ -f "${RESUME_HELPER}" ]] || { echo "Persistent resume helper is missing: ${RESUME_HELPER}" >&2; exit 1; }
   [[ -f "${OMNIGIBSON_DATA_PATH}/2026-challenge-task-instances/metadata/B100_task_misc.csv" ]] || {
     echo "2026 challenge metadata is missing under ${OMNIGIBSON_DATA_PATH}." >&2
     exit 1
@@ -758,6 +741,13 @@ check_run_configuration() {
     "policy_repo=${PI05_REPO}" "policy_server=${PI05_SERVER_SCRIPT}"
     "norm_stats=${PI05_NORM_STATS_PATH}" "base_velocity_frame=${PI05_BASE_VELOCITY_FRAME}"
     "apply_eval_tricks=${PI05_APPLY_EVAL_TRICKS}" "fail_fast=${EVAL_FAIL_FAST}"
+    "actions_to_execute=${PI05_ACTIONS_TO_EXECUTE}" "actions_to_keep=${PI05_ACTIONS_TO_KEEP}"
+    "execute_in_n_steps=${PI05_EXECUTE_IN_N_STEPS}" "history_len=${PI05_HISTORY_LEN}"
+    "votes_to_promote=${PI05_VOTES_TO_PROMOTE}" "num_steps=${PI05_NUM_STEPS}"
+    "disable_fast_auxiliary=${PI05_DISABLE_FAST_AUXILIARY}" "proprioception_schema=${PI05_PROPRIOCEPTION_SCHEMA}"
+    "use_task_checkpoint_mapping=${USE_PI05_TASK_CHECKPOINT_MAPPING}"
+    "task_checkpoint_mapping=$([[ "${USE_PI05_TASK_CHECKPOINT_MAPPING}" == true ]] && printf '%s' "${PI05_TASK_CHECKPOINT_MAPPING}" || true)"
+    "skip_action_chunk_rendering=${PI05_SKIP_ACTION_CHUNK_RENDERING:-false}"
     "run_output_root=${RUN_OUTPUT_ROOT}" "dry_run=${DRY_RUN}"
   )
   python3 - "${RUN_CONFIG_FILE}" "${DLC_RANK}" "${config[@]}" <<'PY'
@@ -848,6 +838,61 @@ write_shared_marker() {
   mkdir -p "$(dirname "${target}")"
   printf '%s\n' "$*" >"${temporary}"
   mv -T -- "${temporary}" "${target}"
+}
+
+initialize_run_paths() {
+  local -a timestamp_args=()
+  local session_parent="${EVAL_LOG_ROOT}"
+  if [[ -n "${RESUME_LOG_DIR}" ]]; then
+    RESUME_LOG_DIR="$(cd "${RESUME_LOG_DIR}" && pwd)"
+    RUN_OUTPUT_ROOT="$(python3 "${RESUME_HELPER}" source-root --log-dir "${RESUME_LOG_DIR}")"
+    session_parent="${RUN_OUTPUT_ROOT}/.sessions"
+  fi
+  [[ "${DRY_RUN}" != true ]] || timestamp_args+=(--dry-run)
+  RUN_TS="$(python3 "${RESUME_HELPER}" timestamp --output-root "${session_parent}" \
+    --key "${DLC_RUN_KEY}" --rank "${DLC_RANK}" --world-size "${DLC_WORLD_SIZE}" \
+    --timeout "${DLC_BARRIER_TIMEOUT}" "${timestamp_args[@]}")"
+
+  SESSION_OUTPUT_ROOT="${session_parent}/${RUN_TS}"
+  if [[ -n "${RESUME_LOG_DIR}" ]]; then
+    GLOBAL_LOG_DIR="${RESUME_LOG_DIR}/.sessions/${RUN_TS}"
+  else
+    GLOBAL_LOG_DIR="${EVAL_LOG_PARENT}/pi05_behavior_2026_persistent_${RUN_TS}"
+    RUN_OUTPUT_ROOT="${SESSION_OUTPUT_ROOT}"
+  fi
+  LOG_DIR="${GLOBAL_LOG_DIR}/rank-${DLC_RANK}"
+
+  # Queue, summaries, stop signal and coordination markers are shared through
+  # NAS. Process logs and PID files remain rank-local.
+  QUEUE_FILE="${GLOBAL_LOG_DIR}/task_queue.tsv"
+  QUEUE_DIR="${GLOBAL_LOG_DIR}/task_queues"
+  ONLINE_QUEUE_FILE="${QUEUE_DIR}/online.tsv"
+  WORKER_RECORD_DIR="${GLOBAL_LOG_DIR}/worker_records"
+  CHUNK_RESULTS_FILE="${GLOBAL_LOG_DIR}/chunk_results.tsv"
+  SCHEDULE_FILE="${GLOBAL_LOG_DIR}/task_schedule.tsv"
+  ASSIGNMENTS_FILE="${GLOBAL_LOG_DIR}/task_assignments.tsv"
+  RESULTS_FILE="${GLOBAL_LOG_DIR}/results.tsv"
+  ATTEMPTS_FILE="${GLOBAL_LOG_DIR}/attempts.tsv"
+  PID_DIR="${LOG_DIR}/pids"
+  STOP_FILE="${GLOBAL_LOG_DIR}/stop_requested"
+  ATTEMPTS_ROOT="${SESSION_OUTPUT_ROOT}/.attempts"
+  CHUNKS_ROOT="${SESSION_OUTPUT_ROOT}/.chunks"
+  RUN_MANIFEST="${RUN_OUTPUT_ROOT}/run_manifest.json"
+  RUN_COMPLETE="${RUN_OUTPUT_ROOT}/run_complete.json"
+
+  COORD_DIR="${GLOBAL_LOG_DIR}/coord"
+  RUN_CONFIG_FILE="${COORD_DIR}/run_config.json"
+  CHECKPOINT_READY_FILE="${COORD_DIR}/checkpoint.path"
+  QUEUE_READY_FILE="${COORD_DIR}/queue.ready"
+  START_FILE="${COORD_DIR}/start.ready"
+  RANK_READY_FILE="${COORD_DIR}/rank-${DLC_RANK}.ready"
+  RANK_DONE_FILE="${COORD_DIR}/rank-${DLC_RANK}.done"
+  RANK_STATUS_FILE="${COORD_DIR}/rank-${DLC_RANK}.status"
+  RANK_HEARTBEAT_FILE="${COORD_DIR}/rank-${DLC_RANK}.heartbeat"
+  FINAL_STATUS_FILE="${COORD_DIR}/final.status"
+  SCHEDULER_ENDPOINT_FILE="${COORD_DIR}/scheduler.endpoint"
+  SCHEDULER_JOURNAL_FILE="${COORD_DIR}/scheduler.journal.jsonl"
+  TIMING_FILE="${GLOBAL_LOG_DIR}/timing.tsv"
 }
 
 wait_for_shared_file() {
@@ -1307,7 +1352,7 @@ worker_loop() {
     assignment_position=$((assignment_position + 1))
     record_assignment "${worker}" "${gpu_id}" "${task_id}" "${task_name}" "${chunk_indices}" \
       "${timeout_steps}" "${chunk_steps}" "${queue_order}" "${assignment_position}"
-    output_dir="${RUN_OUTPUT_ROOT}/.chunks/task-${task_id}_${task_name}/instances-${chunk_indices//,/_}"
+    output_dir="${CHUNKS_ROOT}/task-${task_id}_${task_name}/instances-${chunk_indices//,/_}"
     mkdir -p "$(dirname "${output_dir}")"
     attempt_parent="${ATTEMPTS_ROOT}/task-${task_id}_${task_name}/instances-${chunk_indices//,/_}"
     mkdir -p "${attempt_parent}"
@@ -1444,10 +1489,15 @@ launcher_exit() {
 }
 
 validate_environment
+if [[ "${DRY_RUN}" == true ]] && (( DLC_RANK != 0 )); then
+  echo "Dry-run planning runs on rank 0; no processes started on rank ${DLC_RANK}."
+  exit 0
+fi
 if [[ "${DRY_RUN}" != true ]]; then
   validate_gpu_runtime
 fi
 
+initialize_run_paths
 mkdir -p "${GLOBAL_LOG_DIR}" "${LOG_DIR}" "${PID_DIR}" "${COORD_DIR}"
 
 # Rank 0 alone creates or truncates shared scheduler state. Other ranks wait
@@ -1456,20 +1506,21 @@ if (( DLC_RANK == 0 )); then
   if [[ -e "${QUEUE_READY_FILE}" || -e "${START_FILE}" \
         || -e "${FINAL_STATUS_FILE}" || -e "${ONLINE_QUEUE_FILE}" \
         || -e "${SCHEDULER_ENDPOINT_FILE}" || -e "${SCHEDULER_JOURNAL_FILE}" \
-        || -e "${RUN_MANIFEST}" || -e "${RUN_CONFIG_FILE}" \
+        || ( -e "${RUN_MANIFEST}" && -z "${RESUME_LOG_DIR}" ) || -e "${RUN_CONFIG_FILE}" \
         || -e "${STOP_FILE}" ]]; then
     echo "Refusing to reuse non-empty multi-node run state: ${DLC_RUN_KEY}" >&2
     exit 1
   fi
 fi
 
-# Install failure propagation only after rank 0 has accepted a fresh run key.
+# Install failure propagation only after rank 0 has accepted fresh session paths.
 trap launcher_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if (( DLC_RANK == 0 )); then
   check_run_configuration
+  cp -- "${RUN_CONFIG_FILE}" "${SESSION_OUTPUT_ROOT}/run_config.json"
   # Rank 0 alone may convert a sharded checkpoint. Other nodes wait for the
   # published path instead of competing for a checkpoint lock on NAS.
   resolve_policy_checkpoint
@@ -1503,17 +1554,26 @@ if (( DLC_RANK == 0 )); then
   manifest_video_arg=--no-write-video
   [[ "${EVAL_WRITE_VIDEO}" == true ]] && manifest_video_arg=--write-video
 
-  python3 "${OUTPUT_VALIDATOR}" create-manifest \
-    --queue-file "${QUEUE_FILE}" \
-    --output "${RUN_MANIFEST}" \
-    --run-output-root "${RUN_OUTPUT_ROOT}" \
-    --mode public_test \
-    --instance-indices "${INSTANCE_INDEX_LIST[@]}" \
-    --num-rollouts 1 \
-    --num-vector-envs "${VECTOR_ENVS_PER_PROCESS}" \
-    "${manifest_video_arg}"
+  if [[ -z "${RESUME_LOG_DIR}" ]]; then
+    python3 "${OUTPUT_VALIDATOR}" create-manifest \
+      --queue-file "${QUEUE_FILE}" \
+      --output "${RUN_MANIFEST}" \
+      --run-output-root "${RUN_OUTPUT_ROOT}" \
+      --mode public_test \
+      --instance-indices "${INSTANCE_INDEX_LIST[@]}" \
+      --num-rollouts 1 \
+      --num-vector-envs "${VECTOR_ENVS_PER_PROCESS}" \
+      "${manifest_video_arg}"
 
-  chmod 0444 "${RUN_MANIFEST}"
+    chmod 0444 "${RUN_MANIFEST}"
+  fi
+
+  resume_args=()
+  [[ -z "${RESUME_LOG_DIR}" ]] || resume_args+=(--resume-log-dir "${RESUME_LOG_DIR}")
+  [[ "${DRY_RUN}" != true ]] || resume_args+=(--dry-run)
+  python3 "${RESUME_HELPER}" prepare \
+    --run-root "${RUN_OUTPUT_ROOT}" --log-root "${GLOBAL_LOG_DIR}" \
+    --session-root "${SESSION_OUTPUT_ROOT}" "${resume_args[@]}"
 
   write_shared_marker "${QUEUE_READY_FILE}" \
     "rank=0 tasks=${TASK_COUNT} instances=${#INSTANCE_INDEX_LIST[@]}"
@@ -1564,6 +1624,7 @@ echo "  official dynamics: physics=120 Hz, render/action=30 Hz"
 echo "  local GPUs: ${GPU_ID_LIST[*]}"
 echo "  DLC topology: ${DLC_WORLD_SIZE} nodes x ${NUM_GPUS} local GPUs = ${TOTAL_SCHEDULER_SLOTS} GPU workers"
 echo "  DLC rank: ${DLC_RANK}/${DLC_WORLD_SIZE}"
+echo "  DLC run key / directory name: ${DLC_RUN_KEY} / ${RUN_TS}"
 echo "  topology: 1 persistent server + 1 Isaac Sim process x ${VECTOR_ENVS_PER_PROCESS} vector envs per GPU; joint batch-2 policy requests"
 echo "  scheduler: rank-0 central HTTP longest-task-first queue (${INSTANCE_CHUNK_SIZE} instances/chunk)"
 awk -F '\t' 'NR > 1 {steps += $7; count++} END {
@@ -1592,6 +1653,8 @@ echo "  PI0.5 env: ${PI05_ENV_DIR}"
 echo "  behavior Python: ${BEHAVIOR_PYTHON}"
 echo "  PI0.5 Python: ${PI05_PYTHON}"
 echo "  outputs: ${RUN_OUTPUT_ROOT}"
+echo "  resume log directory: ${RESUME_LOG_DIR:-none (fresh evaluation)}"
+echo "  instance recovery report: ${SESSION_OUTPUT_ROOT}/resume.json"
 echo "  immutable manifest: ${RUN_MANIFEST}"
 echo "  attempts per instance chunk: ${EVAL_MAX_TASK_ATTEMPTS}"
 echo "  scheduler preferred endpoint: ${DLC_SCHEDULER_ADVERTISE_HOST:-rank-0 auto IP}:${DLC_SCHEDULER_PORT}"
@@ -1612,8 +1675,10 @@ connect_dynamic_scheduler
 
 SERVER_PORTS=()
 SERVER_LOGS=()
+LOCAL_WORKER_COUNT="${NUM_GPUS}"
+[[ -s "${ONLINE_QUEUE_FILE}" ]] || LOCAL_WORKER_COUNT=0
 
-for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
+for ((local_worker = 0; local_worker < LOCAL_WORKER_COUNT; local_worker++)); do
   global_worker=$((DLC_RANK * NUM_GPUS + local_worker))
   gpu_id="${GPU_ID_LIST[${local_worker}]}"
   port="$(find_free_port "$((PORT_BASE + local_worker * PORT_STRIDE))")"
@@ -1636,7 +1701,7 @@ done
 
 # Every node loads its local servers concurrently. Evaluators start only
 # after all ranks have published healthy policy servers.
-for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
+for ((local_worker = 0; local_worker < LOCAL_WORKER_COUNT; local_worker++)); do
   global_worker=$((DLC_RANK * NUM_GPUS + local_worker))
 
   wait_for_server \
@@ -1648,7 +1713,7 @@ for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
 done
 
 write_shared_marker "${RANK_READY_FILE}" \
-  "rank=${DLC_RANK} servers=${NUM_GPUS} epoch=$(date +%s)"
+  "rank=${DLC_RANK} servers=${LOCAL_WORKER_COUNT} epoch=$(date +%s)"
 
 if (( DLC_RANK == 0 )); then
   for ((rank_index = 0; rank_index < DLC_WORLD_SIZE; rank_index++)); do
@@ -1677,7 +1742,7 @@ EVALUATION_START_EPOCH="$(<"${START_FILE}")"
 
 start_rank_heartbeat
 
-for ((local_worker = 0; local_worker < NUM_GPUS; local_worker++)); do
+for ((local_worker = 0; local_worker < LOCAL_WORKER_COUNT; local_worker++)); do
   global_worker=$((DLC_RANK * NUM_GPUS + local_worker))
 
   worker_loop \
@@ -1886,17 +1951,18 @@ set -e
 # against the immutable manifest.
 if (( overall_status == 0 )); then
   set +e
-  python3 - "${QUEUE_FILE}" "${RUN_OUTPUT_ROOT}" "${INSTANCE_INDEX_LIST[*]}" "${EVAL_WRITE_VIDEO}" <<'PY'
+  python3 - "${QUEUE_FILE}" "${RUN_OUTPUT_ROOT}" "${INSTANCE_INDEX_LIST[*]}" "${EVAL_WRITE_VIDEO}" "${SESSION_OUTPUT_ROOT}" <<'PY'
 import json
 import shutil
 import sys
 from pathlib import Path
 
-queue_file, run_root_text, all_indices_text, write_video_text = sys.argv[1:]
+queue_file, run_root_text, all_indices_text, write_video_text, session_root_text = sys.argv[1:]
 run_root = Path(run_root_text)
+session_root = Path(session_root_text)
 all_indices = [int(value) for value in all_indices_text.split()]
 write_video = write_video_text == "true"
-chunks_root = run_root / ".chunks"
+chunks_root = session_root / ".chunks"
 for line in Path(queue_file).read_text(encoding="utf-8").splitlines():
     task_id_text, task_name = line.split("\t", 1)
     task_id = int(task_id_text)
@@ -1904,7 +1970,7 @@ for line in Path(queue_file).read_text(encoding="utf-8").splitlines():
     chunk_dirs = sorted((chunks_root / task_prefix).glob("instances-*"))
     if not chunk_dirs:
         raise SystemExit(f"no chunk outputs found for {task_prefix}")
-    final_dir = run_root / task_prefix
+    final_dir = session_root / ".merged" / task_prefix
     final_dir.mkdir(parents=True, exist_ok=False)
     (final_dir / "json").mkdir()
     if write_video:
@@ -1936,6 +2002,12 @@ for line in Path(queue_file).read_text(encoding="utf-8").splitlines():
         "write_video": write_video,
     }
     (final_dir / "evaluation_complete.json").write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+    previous_final = run_root / task_prefix
+    if previous_final.exists():
+        archive = session_root / ".previous_final"
+        archive.mkdir(exist_ok=True)
+        previous_final.rename(archive / task_prefix)
+    final_dir.rename(previous_final)
 PY
   merge_status=$?
   set -e

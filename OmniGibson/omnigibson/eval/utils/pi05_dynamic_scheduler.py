@@ -9,7 +9,6 @@ import argparse
 import hmac
 import json
 import logging
-import os
 import threading
 import urllib.parse
 from collections import deque
@@ -248,8 +247,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     tasks = load_tasks(args.queue_file)
-    if not tasks:
-        raise SystemExit(f"Task queue is empty: {args.queue_file}")
+    # A resumed run may need only final merging/validation, with no rollouts left.
     state = SchedulerState(tasks, args.stop_file, args.journal)
     server = SchedulerHTTPServer((args.host, args.port), state, args.token)
     LOGGER.info("Serving %d task chunks on %s:%d", len(tasks), args.host, args.port)

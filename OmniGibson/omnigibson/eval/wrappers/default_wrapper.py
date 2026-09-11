@@ -21,8 +21,7 @@ class DefaultWrapper(EnvironmentWrapper):
             if not hasattr(sensor, "image_height") or not hasattr(sensor, "image_width"):
                 continue
             set_sensor_modalities(sensor, {"rgb"})
-            # Preserve the capture resolution and its render product. The policy
-            # server resizes the images before passing them to the model.
+            # Preserve the configured capture resolution and its render product.
             sensor_space = sensor.load_observation_space()
             if env.observation_space is not None:
                 env.observation_space.spaces[robot.name].spaces[sensor_name] = sensor_space
