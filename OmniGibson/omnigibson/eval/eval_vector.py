@@ -18,7 +18,7 @@ from omnigibson.eval.utils.cpu_utils import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-name", required=True)
     parser.add_argument("--host", default="127.0.0.1")
@@ -95,7 +95,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-cores-per-env", type=int, default=None)
     parser.add_argument("--cpu-worker-index", type=int, default=None)
     parser.add_argument("--cpu-num-threads", type=int, default=None)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def main() -> None:

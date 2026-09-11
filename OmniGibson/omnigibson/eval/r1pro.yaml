@@ -28,19 +28,19 @@ proprio_obs:
   - trunk_qvel
 grasping_mode: assisted
 sensor_config:
-  # Match the raw demonstration images; the policy server resizes to model input size.
+  # Capture at model input size so the policy server can use the images without resizing.
   VisionSensor:
     sensor_kwargs:
-      image_height: 720
-      image_width: 720
+      image_height: 224
+      image_width: 224
   left_realsense_link:Camera:0:
     sensor_kwargs:
-      image_height: 480
-      image_width: 480
+      image_height: 224
+      image_width: 224
   right_realsense_link:Camera:0:
     sensor_kwargs:
-      image_height: 480
-      image_width: 480
+      image_height: 224
+      image_width: 224
 controller_config:
   arm_left:
     name: JointController

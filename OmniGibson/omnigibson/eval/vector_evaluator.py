@@ -574,11 +574,24 @@ class VectorChunkEvaluator:
             records[slot] = {
                 "instance_id": int(instance_id),
                 "rollout_id": int(rollout_id),
-                "obs": self._preprocess_obs(slot, raw_obs),
                 "metrics": metrics,
                 "final_info": None,
             }
+            self._on_rollout_start(slot, records[slot], raw_obs)
+            records[slot]["obs"] = self._preprocess_obs(slot, raw_obs)
         return records
+
+    def _on_rollout_start(self, slot: int, record: dict, obs: dict) -> None:
+        """Optional collection hook, before adapting the initial observation for the policy."""
+
+    def _before_action_step(self, slots: list[int], actions: list, records: dict[int, dict]) -> None:
+        """Optional collection hook, before simulator-owned observation buffers can change."""
+
+    def _after_action_step(self, slot: int, obs: dict, reward, terminated, truncated, info: dict) -> None:
+        """Optional collection hook for each executed action, including actions inside a chunk."""
+
+    def _on_rollout_end(self, slot: int, record: dict, result: dict) -> None:
+        """Optional collection hook, while the terminal task state still belongs to this rollout."""
 
     def _preprocess_obs(self, slot: int, obs: dict) -> dict:
         obs = flatten_obs_dict(obs)
@@ -707,6 +720,7 @@ class VectorChunkEvaluator:
         }
         for metric in record["metrics"]:
             result.update(metric.aggregate(env))
+        self._on_rollout_end(slot, record, result)
         output_path = json_dir / f"{self.task_name}_{record['instance_id']}_{record['rollout_id']}.json"
         _atomic_json_dump(result, output_path, indent=2, default=float, allow_nan=False)
         _close_video_writer(self.video_writers[slot])
@@ -755,6 +769,7 @@ class VectorChunkEvaluator:
             # retain the normal rendered simulator path.
             skip_chunk_rendering = getattr(self, "skip_action_chunk_rendering", False)
             render_step = not (skip_chunk_rendering and 1 <= action_index <= 9)
+            self._before_action_step(step_slots, actions, records)
             if skip_chunk_rendering:
                 observations, rewards, terminated, truncated, infos = self.vector_env.step(
                     actions, env_indices=step_slots, render=render_step
@@ -772,6 +787,7 @@ class VectorChunkEvaluator:
             for slot, action, obs, reward, is_terminated, is_truncated, info in zip(
                 step_slots, actions, observations, rewards, terminated, truncated, infos
             ):
+                self._after_action_step(slot, obs, reward, is_terminated, is_truncated, info)
                 latest_observations[slot] = obs
                 self.postprocessors[slot].record_executed_actions()
                 for metric in records[slot]["metrics"]:
