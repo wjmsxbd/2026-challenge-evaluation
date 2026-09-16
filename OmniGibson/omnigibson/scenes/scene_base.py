@@ -1119,6 +1119,9 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             self.system_registry.remove(system)
             system.clear()
 
+            # Clearing a system deletes prims and invalidates PhysX tensor views, including those of unrelated objects.
+            og.sim.update_handles()
+
     @property
     def active_systems(self):
         return {system.name: system for system in self.systems if not isinstance(system, Cloth)}
