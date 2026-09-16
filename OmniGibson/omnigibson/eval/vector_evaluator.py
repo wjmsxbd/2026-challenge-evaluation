@@ -16,7 +16,7 @@ import omnigibson as og
 import omnigibson.utils.transform_utils as T
 import torch as th
 from gello.utils.og_teleop_cfg import DISABLED_TRANSITION_RULES
-from gello.utils.og_teleop_utils import augment_rooms, get_task_relevant_room_types, load_available_tasks
+from gello.utils.og_teleop_utils import load_available_tasks
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
@@ -30,6 +30,7 @@ from omnigibson.eval.policies import WebsocketPolicy
 from omnigibson.eval.utils.eval_utils import (
     EVAL_TIMEOUT_MULTIPLIER,
     PROPRIOCEPTION_INDICES,
+    TASK_NAMES_TO_ROOMS,
     flatten_obs_dict,
     generate_basic_environment_config,
     get_robot_camera_names,
@@ -316,11 +317,10 @@ class VectorChunkEvaluator:
             raise ValueError(f"Unknown BEHAVIOR task: {self.task_name}")
         task_cfg = available_tasks[self.task_name][0]
         config = generate_basic_environment_config(task_name=self.task_name, task_cfg=task_cfg)
-        # SPEEDUP_EVAL: load only rooms relevant to this activity to reduce scene
-        # construction, physics, and rendering cost without changing task objects.
+        # SPEEDUP_EVAL: load the exact room instances selected in the official task metadata.
         if bool(self.cfg.partial_scene_load):
-            rooms = get_task_relevant_room_types(activity_name=self.task_name)
-            config["scene"]["load_room_types"] = augment_rooms(rooms, task_cfg["scene_model"], self.task_name)
+            config["scene"]["load_room_types"] = None
+            config["scene"]["load_room_instances"] = TASK_NAMES_TO_ROOMS[self.task_name]
 
         robot_path = self.cfg.get("robot_config") or DEFAULT_ROBOT_CONFIG_PATH
         robot_cfg = _plain_dict(OmegaConf.load(str(robot_path)))
