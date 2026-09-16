@@ -36,6 +36,12 @@ from omnigibson.eval.utils.eval_utils import (
 )
 from omnigibson.eval.utils.light_utils import LightToggleSynchronizer, set_light_control_toggles
 from omnigibson.eval.utils.obs_utils import create_video_writer, write_video
+from omnigibson.eval.utils.pi_behavior_hybrid_action import (
+    PI_BEHAVIOR_EEF_ACTION_DIM,
+    PI_BEHAVIOR_JOINT_ACTION_DIM,
+    compose_pi_behavior_hybrid_action_chunk,
+    validate_pi_behavior_hybrid_config,
+)
 from omnigibson.eval.utils.score_utils import load_human_stats
 from omnigibson.macros import gm
 from omnigibson.metrics import AgentMetric, TaskMetric
@@ -283,7 +289,7 @@ class VectorChunkEvaluator:
 
         logger.info(
             "Vector chunk evaluation: envs=%s request_batch_max=%s env_seeds=%s actions=%s->%s "
-            "base_velocity_frame=%s action_chunk_maintenance=%s compression=%s "
+            "control=%s base_velocity_frame=%s action_chunk_maintenance=%s compression=%s "
             "get_obs/metrics every action=true rendering=per-action-or-chunk-skip "
             "skip_action_chunk_rendering=%s "
             "video_every_action=%s viewer_camera=%s",
@@ -292,6 +298,7 @@ class VectorChunkEvaluator:
             self.env_seeds,
             self.postprocessor_config.actions_to_execute,
             self.postprocessor_config.execute_in_n_steps,
+            "hybrid_eef" if self.hybrid_eef_control else "joint",
             str(cfg.base_velocity_frame),
             self.postprocessor_config.enable_action_chunk_maintenance,
             self.postprocessor_config.enable_compression,
@@ -353,8 +360,16 @@ class VectorChunkEvaluator:
             raise ValueError("Vector PI0.5 evaluation requires exactly one robot per environment")
         if any(robot.model != "r1pro" or robot.name != "robot_r1" for robot in self.robots):
             raise ValueError("This PI0.5 checkpoint requires an R1Pro named 'robot_r1' in every environment")
-        if any(robot.action_dim != 23 for robot in self.robots):
-            raise ValueError(f"PI0.5 action chunks require action_dim=23, got {[r.action_dim for r in self.robots]}")
+        action_dims = [int(robot.action_dim) for robot in self.robots]
+        if len(set(action_dims)) != 1:
+            raise ValueError(f"All vector R1Pro robots must use the same action dimension, got {action_dims}")
+        self.hybrid_eef_control = validate_pi_behavior_hybrid_config(
+            action_dims[0],
+            proprioception_schema=str(self.cfg.proprioception_schema),
+            apply_eval_tricks=self.postprocessor_config.apply_eval_tricks,
+            enable_action_chunk_maintenance=self.postprocessor_config.enable_action_chunk_maintenance,
+            enable_compression=self.postprocessor_config.enable_compression,
+        )
 
         required_roles = {"head", "left_wrist", "right_wrist"}
         missing_roles = sorted(required_roles - set(self.robot_camera_names))
@@ -408,6 +423,26 @@ class VectorChunkEvaluator:
                 "Evaluator/server proprioception schema mismatch: "
                 f"{self.cfg.proprioception_schema} != {protocol.get('proprioception_schema')}"
             )
+        if self.hybrid_eef_control:
+            if "eef_action_chunk" not in capabilities:
+                raise RuntimeError("Hybrid EEF evaluation requires the server capability 'eef_action_chunk'")
+            expected_hybrid_metadata = {
+                "action_dim": PI_BEHAVIOR_JOINT_ACTION_DIM,
+                "action_horizon": self.postprocessor_config.action_horizon,
+                "eef_action_dim": PI_BEHAVIOR_EEF_ACTION_DIM,
+                "eef_frame": "base",
+                "eef_delta_reference": "chunk_anchor_body_relative_configuration",
+            }
+            mismatches = {
+                key: (protocol.get(key), expected)
+                for key, expected in expected_hybrid_metadata.items()
+                if protocol.get(key) != expected
+            }
+            if mismatches:
+                raise RuntimeError(
+                    "Hybrid EEF evaluator/server metadata mismatch "
+                    f"(actual, expected): {mismatches}"
+                )
         server_batch_size = protocol.get("policy_batch_size")
         if server_batch_size != self.num_envs:
             raise RuntimeError(
@@ -656,12 +691,11 @@ class VectorChunkEvaluator:
         # SPEEDUP_EVAL: one observation_batch produces one model batch (normally
         # batch-2, or batch-1 after a slot terminates).
         requests = [self._policy_obs(slot, records[slot]["obs"]) for slot in active_slots]
-        states = [
-            _extract_pi05_state(
-                records[slot]["obs"][f"{self.robots[slot].name}::proprio"].detach().cpu().numpy().copy()
-            )
+        proprioceptions = [
+            records[slot]["obs"][f"{self.robots[slot].name}::proprio"].detach().cpu().numpy().copy()
             for slot in active_slots
         ]
+        states = [_extract_pi05_state(proprio) for proprio in proprioceptions]
         payload = _snapshot_policy_value({"observation_batch": requests})
         for slot, request in zip(active_slots, payload["observation_batch"]):
             if slot in self._policy_image_shapes_logged:
@@ -679,17 +713,42 @@ class VectorChunkEvaluator:
             self._policy_image_shapes_logged.add(slot)
         response = self.policy.infer(payload)
         action_chunks = np.asarray(response.get("action_chunk"))
+        hybrid_eef_control = getattr(self, "hybrid_eef_control", False)
+        eef_action_chunks = np.asarray(response.get("eef_action_chunk")) if hybrid_eef_control else None
         logits = np.asarray(response.get("subtask_logits"))
         batch_size = len(active_slots)
         expected_prefix = (batch_size, self.postprocessor_config.action_horizon)
         if action_chunks.shape[:2] != expected_prefix:
             raise RuntimeError(f"Unexpected action_chunk shape {action_chunks.shape}; expected {expected_prefix} + D")
+        if hybrid_eef_control:
+            expected_joint_shape = (*expected_prefix, PI_BEHAVIOR_JOINT_ACTION_DIM)
+            expected_eef_shape = (*expected_prefix, PI_BEHAVIOR_EEF_ACTION_DIM)
+            if action_chunks.shape != expected_joint_shape:
+                raise RuntimeError(
+                    f"Unexpected hybrid action_chunk shape {action_chunks.shape}; expected {expected_joint_shape}"
+                )
+            if eef_action_chunks.shape != expected_eef_shape:
+                raise RuntimeError(
+                    f"Unexpected eef_action_chunk shape {eef_action_chunks.shape}; expected {expected_eef_shape}"
+                )
+            if not np.isfinite(eef_action_chunks).all():
+                raise RuntimeError("eef_action_chunk must contain only finite values")
         if logits.ndim != 2 or logits.shape[0] != batch_size:
             raise RuntimeError(f"Unexpected subtask_logits shape: {logits.shape}; expected batch {batch_size}")
-        return {
-            slot: self.postprocessors[slot].process(action_chunks[index], logits[index], states[index])
-            for index, slot in enumerate(active_slots)
-        }
+
+        execution_chunks = {}
+        for index, slot in enumerate(active_slots):
+            joint_chunk = self.postprocessors[slot].process(action_chunks[index], logits[index], states[index])
+            if hybrid_eef_control:
+                eef_chunk = eef_action_chunks[index, : len(joint_chunk)]
+                execution_chunks[slot] = compose_pi_behavior_hybrid_action_chunk(
+                    joint_chunk,
+                    eef_chunk,
+                    proprioceptions[index],
+                )
+            else:
+                execution_chunks[slot] = joint_chunk
+        return execution_chunks
 
     def _write_video(self, slot: int, obs: dict) -> None:
         if self.video_paths[slot] is None:
@@ -838,7 +897,6 @@ class VectorChunkEvaluator:
         json_dir.mkdir(parents=True, exist_ok=True)
         if bool(self.cfg.write_video):
             video_dir.mkdir(parents=True, exist_ok=True)
-
         results = []
         for start in range(0, len(instance_ids), self.num_envs):
             group = instance_ids[start : start + self.num_envs]
