@@ -87,6 +87,9 @@ PI05_HISTORY_LEN="${PI05_HISTORY_LEN:-3}"
 PI05_VOTES_TO_PROMOTE="${PI05_VOTES_TO_PROMOTE:-2}"
 PI05_NUM_STEPS="${PI05_NUM_STEPS:-20}"
 PI05_APPLY_EVAL_TRICKS="${PI05_APPLY_EVAL_TRICKS:-true}"
+PI05_ACTION_CHUNK_MAINTENANCE="${PI05_ACTION_CHUNK_MAINTENANCE:-true}"
+PI05_COMPRESSION="${PI05_COMPRESSION:-true}"
+PI05_ROBOT_CONFIG="${PI05_ROBOT_CONFIG:-}"
 PI05_DISABLE_FAST_AUXILIARY="${PI05_DISABLE_FAST_AUXILIARY:-true}"
 PI05_PROPRIOCEPTION_SCHEMA="${PI05_PROPRIOCEPTION_SCHEMA:-r1pro_v3_61}"
 PI05_BASE_VELOCITY_FRAME="${PI05_BASE_VELOCITY_FRAME:-absolute}"
@@ -179,8 +182,12 @@ Core overrides:
   PI05_CONVERT_SCRIPT       Sharded-checkpoint merge script.
   PI05_NORM_STATS_PATH      2026 checkpoint normalization statistics.
   PI05_BASE_VELOCITY_FRAME  Policy observation base qvel frame: absolute (legacy raw) or relative (robot-local), default absolute. Actions are always robot-local.
+  PI05_ROBOT_CONFIG         Optional evaluator robot YAML; empty uses the standard 23-D joint controller config.
+  PI05_ACTION_CHUNK_MAINTENANCE  Carry an action tail into the next request, default true.
+  PI05_COMPRESSION          Interpolate 26 predicted actions into 20 simulator actions, default true.
   PI05_ENV_DIR              Policy runtime, default the sibling behavior-1k-solution/.venv.
   BEHAVIOR_ENV_DIR          2026 evaluator conda environment directory.
+  BEHAVIOR_CONDA_SH         Optional conda.sh from a working installation to activate that environment.
   DRIVER_FIX_SCRIPT         Script sourced when starting an evaluator process, default ~/driver_fix/activate.sh.
   WORLD_SIZE / RANK         DLC node count / node rank (not torchrun process ranks), default 1 / 0.
   NPROC_PER_NODE            Available GPUs per node; NUM_GPUS defaults to this value, or 8.
@@ -495,6 +502,8 @@ validate_environment() {
   validate_bool EVAL_PARTIAL_SCENE_LOAD "${EVAL_PARTIAL_SCENE_LOAD}"
   validate_bool EVAL_FAIL_FAST "${EVAL_FAIL_FAST}"
   validate_bool PI05_APPLY_EVAL_TRICKS "${PI05_APPLY_EVAL_TRICKS}"
+  validate_bool PI05_ACTION_CHUNK_MAINTENANCE "${PI05_ACTION_CHUNK_MAINTENANCE}"
+  validate_bool PI05_COMPRESSION "${PI05_COMPRESSION}"
   validate_bool PI05_DISABLE_FAST_AUXILIARY "${PI05_DISABLE_FAST_AUXILIARY}"
   validate_bool PI05_AUTO_CONVERT_CKPT "${PI05_AUTO_CONVERT_CKPT}"
   validate_bool USE_PI05_TASK_CHECKPOINT_MAPPING "${USE_PI05_TASK_CHECKPOINT_MAPPING}"
@@ -522,6 +531,10 @@ validate_environment() {
     exit 1
   }
   [[ -f "${PI05_SERVER_SCRIPT}" ]] || { echo "PI0.5 vector server is missing: ${PI05_SERVER_SCRIPT}" >&2; exit 1; }
+  [[ -z "${PI05_ROBOT_CONFIG}" || -f "${PI05_ROBOT_CONFIG}" ]] || {
+    echo "PI05_ROBOT_CONFIG is missing: ${PI05_ROBOT_CONFIG}" >&2
+    exit 1
+  }
   [[ -f "${BEHAVIOR_ROOT}/OmniGibson/omnigibson/eval/eval_persistent.py" ]] || {
     echo "2026 vector evaluator is missing under ${BEHAVIOR_ROOT}." >&2
     exit 1
@@ -741,6 +754,8 @@ check_run_configuration() {
     "policy_repo=${PI05_REPO}" "policy_server=${PI05_SERVER_SCRIPT}"
     "norm_stats=${PI05_NORM_STATS_PATH}" "base_velocity_frame=${PI05_BASE_VELOCITY_FRAME}"
     "apply_eval_tricks=${PI05_APPLY_EVAL_TRICKS}" "fail_fast=${EVAL_FAIL_FAST}"
+    "action_chunk_maintenance=${PI05_ACTION_CHUNK_MAINTENANCE}" "compression=${PI05_COMPRESSION}"
+    "robot_config=${PI05_ROBOT_CONFIG}"
     "actions_to_execute=${PI05_ACTIONS_TO_EXECUTE}" "actions_to_keep=${PI05_ACTIONS_TO_KEEP}"
     "execute_in_n_steps=${PI05_EXECUTE_IN_N_STEPS}" "history_len=${PI05_HISTORY_LEN}"
     "votes_to_promote=${PI05_VOTES_TO_PROMOTE}" "num_steps=${PI05_NUM_STEPS}"
@@ -1173,9 +1188,13 @@ launch_eval() {
   )
   [[ -z "${EVAL_MAX_STEPS}" ]] || args+=(--max-steps "${EVAL_MAX_STEPS}")
   [[ -n "${EVAL_MAX_STEPS}" ]] || args+=(--max-steps-multiplier "${EVAL_MAX_STEPS_MULTIPLIER}")
+  [[ -z "${PI05_ROBOT_CONFIG}" ]] || args+=(--robot-config "${PI05_ROBOT_CONFIG}")
   [[ "${EVAL_WRITE_VIDEO}" == true ]] && args+=(--write-video) || args+=(--no-write-video)
   [[ "${EVAL_PARTIAL_SCENE_LOAD}" == true ]] && args+=(--partial-scene-load) || args+=(--no-partial-scene-load)
   [[ "${PI05_APPLY_EVAL_TRICKS}" == true ]] && args+=(--apply-eval-tricks) || args+=(--no-apply-eval-tricks)
+  [[ "${PI05_ACTION_CHUNK_MAINTENANCE}" == true ]] \
+    && args+=(--action-chunk-maintenance) || args+=(--no-action-chunk-maintenance)
+  [[ "${PI05_COMPRESSION}" == true ]] && args+=(--compression) || args+=(--no-compression)
   args+=(--headless --no-render-viewer-camera)
 
   (
@@ -1183,7 +1202,7 @@ launch_eval() {
     conda_root="$(dirname "$(dirname "${behavior_env_dir}")")"
     set +u
     source "${DRIVER_FIX_SCRIPT}"
-    source "${conda_root}/etc/profile.d/conda.sh"
+    source "${BEHAVIOR_CONDA_SH:-${conda_root}/etc/profile.d/conda.sh}"
     conda activate "${behavior_env_dir}"
     set -u
     gpu_inventory=""
@@ -1625,7 +1644,7 @@ echo "  local GPUs: ${GPU_ID_LIST[*]}"
 echo "  DLC topology: ${DLC_WORLD_SIZE} nodes x ${NUM_GPUS} local GPUs = ${TOTAL_SCHEDULER_SLOTS} GPU workers"
 echo "  DLC rank: ${DLC_RANK}/${DLC_WORLD_SIZE}"
 echo "  DLC run key / directory name: ${DLC_RUN_KEY} / ${RUN_TS}"
-echo "  topology: 1 persistent server + 1 Isaac Sim process x ${VECTOR_ENVS_PER_PROCESS} vector envs per GPU; joint batch-2 policy requests"
+  echo "  topology: 1 persistent server + 1 Isaac Sim process x ${VECTOR_ENVS_PER_PROCESS} vector envs per GPU; batch-2 policy requests"
 echo "  scheduler: rank-0 central HTTP longest-task-first queue (${INSTANCE_CHUNK_SIZE} instances/chunk)"
 awk -F '\t' 'NR > 1 {steps += $7; count++} END {
   printf "    pending chunks=%d estimated_steps=%d\n", count + 0, steps + 0
@@ -1644,8 +1663,10 @@ echo "  resolved checkpoint: ${PI05_RESOLVED_POLICY_DIR}"
 echo "  checkpoint auto-convert: ${PI05_AUTO_CONVERT_CKPT} (${PI05_CONVERT_SCRIPT})"
 echo "  norm stats: ${PI05_NORM_STATS_PATH}"
 echo "  checkpoint mapping: enabled=${USE_PI05_TASK_CHECKPOINT_MAPPING}, path=${PI05_TASK_CHECKPOINT_MAPPING}"
-echo "  proprioception schema: ${PI05_PROPRIOCEPTION_SCHEMA}"
-echo "  base velocity frame: ${PI05_BASE_VELOCITY_FRAME}"
+  echo "  proprioception schema: ${PI05_PROPRIOCEPTION_SCHEMA}"
+  echo "  base velocity frame: ${PI05_BASE_VELOCITY_FRAME}"
+echo "  robot config: ${PI05_ROBOT_CONFIG:-default 23-D joint control}"
+echo "  action maintenance / compression / eval tricks: ${PI05_ACTION_CHUNK_MAINTENANCE} / ${PI05_COMPRESSION} / ${PI05_APPLY_EVAL_TRICKS}"
 echo "  environment seed: ${EVAL_SEED}"
 echo "  behavior env: ${BEHAVIOR_ENV_DIR}"
 echo "  GPU driver activation: ${DRIVER_FIX_SCRIPT} (sourced on evaluator process startup)"
